@@ -6,6 +6,7 @@ import { TOEICQuestion, AIAnswer } from './types';
 export async function solveQuestion(question: TOEICQuestion): Promise<AIAnswer> {
   const response = await fetch('/api/solve', {
     method: 'POST',
+    signal: AbortSignal.timeout(25000),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       part: question.part,

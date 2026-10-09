@@ -7,7 +7,6 @@ interface LiveTranscriptProps {
   interimTranscript: string;
   isListening: boolean;
   onFeedText?: (text: string) => void;
-  onRunDemo?: () => void;
 }
 
 export default function LiveTranscript({
@@ -15,7 +14,6 @@ export default function LiveTranscript({
   interimTranscript,
   isListening,
   onFeedText,
-  onRunDemo,
 }: LiveTranscriptProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -53,15 +51,6 @@ export default function LiveTranscript({
         </div>
         
         <div className="flex items-center gap-2">
-          {onRunDemo && (
-            <button
-              onClick={onRunDemo}
-              className="px-2 py-0.5 rounded text-[10px] font-medium text-violet-300 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-500/20 transition-colors cursor-pointer"
-              title="Chạy mô phỏng bài nghe TOEIC mẫu để kiểm tra"
-            >
-              ▶ Thử bài mẫu
-            </button>
-          )}
           {isListening && (
             <div className="flex items-center gap-1.5">
               <span className="relative flex h-1.5 w-1.5">
@@ -109,7 +98,7 @@ export default function LiveTranscript({
                 : 'Bấm Bắt đầu nghe để nhận diện'}
             </p>
             <p className="text-[11px] text-zinc-600 max-w-[200px]">
-              Hãy bật loa gần máy tính hoặc bấm &ldquo;Thử bài mẫu&rdquo; ở trên.
+              Hãy bật loa gần máy tính hoặc chia sẻ trực tiếp âm thanh từ tab trình duyệt.
             </p>
           </div>
         )}

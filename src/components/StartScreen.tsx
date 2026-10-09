@@ -3,7 +3,6 @@
 interface StartScreenProps {
   onStart: () => void;
   onStartTabAudio?: () => void;
-  onDemo?: () => void;
   isSpeechAvailable: boolean;
   lastError: string | null;
 }
@@ -11,7 +10,6 @@ interface StartScreenProps {
 export default function StartScreen({
   onStart,
   onStartTabAudio,
-  onDemo,
   lastError,
 }: StartScreenProps) {
   return (
@@ -85,20 +83,6 @@ export default function StartScreen({
             </button>
           )}
 
-          {/* Demo Button */}
-          {onDemo && (
-            <button
-              onClick={onDemo}
-              className="
-                inline-flex items-center justify-center gap-1.5 px-4 py-2
-                rounded-lg text-xs font-medium text-violet-400 hover:text-violet-300
-                hover:bg-violet-500/10 transition-colors cursor-pointer
-              "
-            >
-              <span>▶</span>
-              <span>Chạy thử bài mẫu TOEIC ngay</span>
-            </button>
-          )}
         </div>
         
         <p className="mt-6 text-xs text-zinc-600">

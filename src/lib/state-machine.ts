@@ -9,7 +9,7 @@ import {
   PassageBuffer,
 } from './types';
 import {
-  detectQuestionNumber,
+  questionMarkers,
   detectQuestionText,
   detectPassageHeader,
   detectTOEICPart,
@@ -17,7 +17,6 @@ import {
   getRequiredChoiceLetters,
   hasRequiredChoices,
   inferTOEICPart,
-  countChoices,
 } from './toeic-detector';
 import { GROUP_HEADER, listeningGroupStart, listeningMarkers, normalizeListeningNumbers } from './listening-groups';
 
@@ -181,7 +180,8 @@ export class TOEICStateMachine {
     if (
       this.context.appState === 'QUESTION_COMPLETE' ||
       this.context.appState === 'SOLVING' ||
-      this.context.appState === 'ANSWER_READY'
+      this.context.appState === 'ANSWER_READY' ||
+      (this.context.appState === 'ERROR' && !!this.context.currentQuestion)
     ) {
       this.deferredTranscriptBuffer += ' ' + finalText;
       return;
@@ -199,113 +199,60 @@ export class TOEICStateMachine {
 
     this.currentPart = detectTOEICPart(buffer) || this.currentPart;
 
-    if (this.currentPart === 3 || this.currentPart === 4 ||
+    const firstMarker = questionMarkers(buffer).find(m => !this.context.processedQuestions.has(m.number));
+    if ((!firstMarker || firstMarker.number >= 32) && (this.currentPart === 3 || this.currentPart === 4 ||
         listeningMarkers(buffer).length > 0 ||
-        (detectPassageHeader(buffer)?.start || 0) >= 32) {
+        (detectPassageHeader(buffer)?.start || 0) >= 32)) {
       this.runListeningGroupDetection(buffer);
       return;
     }
 
-    // 1. Detect passage headers
-    const passageHeader = detectPassageHeader(buffer);
-    if (passageHeader) {
-      this.context.currentPassage = {
-        id: `passage-${passageHeader.start}-${passageHeader.end}`,
-        text: '',
-        questionRange: { start: passageHeader.start, end: passageHeader.end },
-        part: inferTOEICPart(passageHeader.start) || this.currentPart,
-        timestamp: Date.now(),
-      };
-      this.emit();
-    }
+    this.runPartTwoDetection(buffer);
+  }
 
-    // 2. Detect question
-    const questionNum = detectQuestionNumber(buffer);
-    const questionText = detectQuestionText(
-      buffer,
-      questionNum || this.context.currentQuestion?.questionNumber
-    );
+  private runPartTwoDetection(buffer: string) {
+    const markers = questionMarkers(buffer);
+    const highWater = Math.max(6, ...this.context.processedQuestions);
+    const firstIndex = markers.findIndex(m => m.number > highWater);
+    if (firstIndex < 0) return;
+    const first = markers[firstIndex];
+    if (first.number > 31) return;
+    const next = markers.slice(firstIndex + 1).find(m => m.number > first.number);
+    const header = buffer.match(GROUP_HEADER);
+    const boundary = Math.min(next?.start ?? buffer.length, header?.index ?? buffer.length);
+    const segment = buffer.slice(first.start, boundary);
+    const text = detectQuestionText(segment, first.number) || '';
+    const choices = extractChoices(segment, first.number);
+    this.currentPart = 2;
+    this.context.currentQuestion = {
+      questionNumber: first.number, questionText: text, choices, passage: '', part: 2,
+    };
+    this.context.currentAnswer = null;
+    this.context.lastError = null;
+    this.questionDetectionBuffer = buffer.slice(first.start);
+    this.setState(hasRequiredChoices(choices, 2) ? 'QUESTION_DETECTED' : 'WAITING_FOR_CHOICES');
+    this.emit();
 
-    if (questionNum && !this.context.processedQuestions.has(questionNum)) {
-      // If a previous question is pending, complete it before moving to the new one
-      if (
-        this.context.currentQuestion &&
-        this.context.currentQuestion.questionNumber !== questionNum &&
-        (this.context.appState === 'QUESTION_DETECTED' || this.context.appState === 'WAITING_FOR_CHOICES')
-      ) {
-        this.handleQuestionComplete();
-        return;
-      }
-
-      // New question detected
-      if (this.lastDetectedQuestionNum !== questionNum) {
-        this.lastDetectedQuestionNum = questionNum;
-        this.lastChoiceCount = 0;
-
-        // Use the recent transcript buffer as passage context
-        const part = inferTOEICPart(questionNum) || this.currentPart || this.context.currentPassage?.part;
-        const passageContext = part === 2 ? '' : this.context.transcriptBuffer.trim();
-
-        this.context.currentQuestion = {
-          questionNumber: questionNum,
-          questionText: questionText || '',
-          choices: {},
-          passage: passageContext,
-          part,
-        };
-        this.context.currentAnswer = null;
-        this.setState('QUESTION_DETECTED');
-
-        // A number can arrive before the spoken question. Do not call the API
-        // until actual question text is available.
-        if (questionText) this.scheduleAutoSolve(6000);
-      }
-    }
-
-    // Update question text if we have a current question
-    if (
-      this.context.currentQuestion &&
-      questionText &&
-      questionText.length > (this.context.currentQuestion.questionText?.length || 0)
-    ) {
-      this.context.currentQuestion.questionText = questionText;
-      this.scheduleAutoSolve(6000);
-      this.emit();
-    }
-
-    // 3. Detect choices
-    if (this.context.currentQuestion) {
-      const choices = extractChoices(buffer, this.context.currentQuestion.questionNumber);
-      const newCount = countChoices(choices);
-
-      if (newCount > this.lastChoiceCount) {
-        this.lastChoiceCount = newCount;
-
-        // Merge detected choices
-        if (choices.A) this.context.currentQuestion.choices.A = choices.A;
-        if (choices.B) this.context.currentQuestion.choices.B = choices.B;
-        if (choices.C) this.context.currentQuestion.choices.C = choices.C;
-        if (choices.D) this.context.currentQuestion.choices.D = choices.D;
-
-        if (!hasRequiredChoices(
-          this.context.currentQuestion.choices,
-          this.context.currentQuestion.part
-        )) {
-          this.setState('WAITING_FOR_CHOICES');
-          // Extend timer while choices are still arriving
-          this.scheduleAutoSolve(4500);
-        }
-        this.emit();
-      }
-
-      // Part 2 has three responses; Parts 3 and 4 have four choices.
-      if (hasRequiredChoices(
-        this.context.currentQuestion.choices,
-        this.context.currentQuestion.part
-      )) {
+    if (boundary < buffer.length) {
+      // Preserve every subsequent question before completion clears the buffer.
+      this.deferredTranscriptBuffer = buffer.slice(boundary) + ' ' + this.deferredTranscriptBuffer;
+      if (text) {
+        void this.handleQuestionComplete();
+      } else {
+        // A number-only / corrupt question must never block the next real one.
+        this.context.history.push({ questionNumber: first.number, timestamp: Date.now() });
+        this.context.processedQuestions.add(first.number);
         this.clearAutoSolve();
-        this.handleQuestionComplete();
+        this.questionDetectionBuffer = '';
+        this.resumeListening();
       }
+      return;
+    }
+    if (!text) return;
+    if (hasRequiredChoices(choices, 2) && /[.!?]["'’”]?$/.test(choices.C!.trim())) {
+      void this.handleQuestionComplete();
+    } else {
+      this.scheduleAutoSolve(hasRequiredChoices(choices, 2) ? 1200 : 6000);
     }
   }
 
@@ -415,8 +362,15 @@ export class TOEICStateMachine {
     
     // Call AI solver
     if (this.solveCallback) {
+      let solveTimeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        const answer = await this.solveCallback(question);
+        const answer = await Promise.race([
+          this.solveCallback(question),
+          new Promise<AIAnswer>((_, reject) => {
+            solveTimeout = setTimeout(() => reject(new Error('AI solve timeout')), 30000);
+          }),
+        ]);
+        clearTimeout(solveTimeout);
         if (sessionVersion !== this.sessionVersion) return;
         this.context.currentAnswer = answer;
         
@@ -439,6 +393,7 @@ export class TOEICStateMachine {
         }, 2500);
         
       } catch (error) {
+        clearTimeout(solveTimeout);
         if (sessionVersion !== this.sessionVersion) return;
         console.error('AI solver error:', error);
         this.context.lastError = 'Unable to analyze this question. Continuing listening...';

@@ -35,7 +35,6 @@ export interface UseTOEICReturn {
   clearError: () => void;
   forceSolve: () => void;
   feedTranscript: (text: string) => void;
-  runDemoSimulation: () => void;
   
   // Speech available
   isSpeechAvailable: boolean;
@@ -232,32 +231,6 @@ export function useTOEIC(): UseTOEICReturn {
     sm.processTranscript(text);
   }, []);
 
-  const runDemoSimulation = useCallback(() => {
-    const sm = stateMachineRef.current;
-    if (!sm) return;
-    
-    // Start listening state
-    setAppState('LISTENING');
-    sm.start();
-
-    const demoSteps = [
-      { text: "Questions 71 through 73 refer to the following announcement.", delay: 300 },
-      { text: "Good afternoon, all employees. Please be advised that the main office building will undergo annual maintenance this Saturday.", delay: 1800 },
-      { text: "The power and internet will be shut off from 8:00 AM to 5:00 PM.", delay: 3600 },
-      { text: "Therefore, all staff members who plan to work over the weekend should work remotely from home.", delay: 5500 },
-      { text: "Number 71. What is the purpose of the announcement?", delay: 7500 },
-      { text: "Number 72. When will the maintenance take place?", delay: 10500 },
-      { text: "Number 73. What are employees advised to do?", delay: 13500 },
-    ];
-
-    demoSteps.forEach(({ text, delay }) => {
-      setTimeout(() => {
-        setTranscript((prev) => (prev ? prev + ' ' + text : text));
-        sm.processTranscript(text);
-      }, delay);
-    });
-  }, []);
-
   return {
     appState,
     microphoneState,
@@ -275,7 +248,6 @@ export function useTOEIC(): UseTOEICReturn {
     clearError,
     forceSolve,
     feedTranscript,
-    runDemoSimulation,
     isSpeechAvailable,
   };
 }

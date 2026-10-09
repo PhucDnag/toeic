@@ -13,24 +13,39 @@ const CHUNK_SAMPLES = TARGET_SAMPLE_RATE * 4;
 const OVERLAP_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.8);
 const PAUSE_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.35);
 const MIN_FINAL_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.05);
+const MIN_PAUSE_CHUNK_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 1.2);
+const AUDIBLE_RMS = 0.00015;
 
 interface AudioChunk {
   samples: Float32Array;
   sessionId: number;
 }
 
-function hasAudibleAudio(samples: Float32Array): boolean {
+export function hasAudibleAudio(samples: Float32Array): boolean {
   let energy = 0;
   let activeSamples = 0;
   for (let index = 0; index < samples.length; index++) {
     const amplitude = Math.abs(samples[index]);
     energy += amplitude * amplitude;
-    if (amplitude >= 0.002) activeSamples++;
+    if (amplitude >= AUDIBLE_RMS) activeSamples++;
   }
 
   const rms = Math.sqrt(energy / Math.max(1, samples.length));
   const activeRatio = activeSamples / Math.max(1, samples.length);
-  return rms >= 0.0005 && activeRatio >= 0.003;
+  return rms >= AUDIBLE_RMS && activeRatio >= 0.01;
+}
+
+export function normalizeAudio(samples: Float32Array): Float32Array {
+  let energy = 0;
+  let peak = 0;
+  for (const sample of samples) {
+    energy += sample * sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+  const rms = Math.sqrt(energy / Math.max(1, samples.length));
+  if (!peak || rms < AUDIBLE_RMS) return samples;
+  const gain = Math.min(16, 0.06 / rms, 0.95 / peak);
+  return samples.map(sample => sample * gain);
 }
 
 function encodeWav(samples: Float32Array, sampleRate = 16000): Blob {
@@ -127,6 +142,8 @@ export class AudioCaptureService {
   private audioContext: AudioContext | null = null;
   private stream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
+  private worklet: AudioWorkletNode | null = null;
+  private flushWorklet: (() => void) | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private isCapturing = false;
 
@@ -160,6 +177,7 @@ export class AudioCaptureService {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          channelCount: { ideal: 1 },
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: true,
@@ -202,6 +220,7 @@ export class AudioCaptureService {
   private async startWithStream(stream: MediaStream): Promise<boolean> {
     // A new source must never receive a late transcript from the previous one.
     await this.stop(false);
+    const captureSession = this.sessionId;
     this.stream = stream;
 
     try {
@@ -214,9 +233,11 @@ export class AudioCaptureService {
 
       const sampleRate = this.audioContext.sampleRate;
       this.source = this.audioContext.createMediaStreamSource(stream);
+      const highPass = this.audioContext.createBiquadFilter();
+      highPass.type = 'highpass';
+      highPass.frequency.value = 70;
+      this.source.connect(highPass);
 
-      // ScriptProcessorNode with 4096 buffer size
-      this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
       this.sampleBuffer = [];
       this.pendingChunks = [];
       this.hasQueuedChunk = false;
@@ -226,10 +247,8 @@ export class AudioCaptureService {
       this.committedTranscript = '';
       this.isCapturing = true;
 
-      this.processor.onaudioprocess = (e) => {
+      const receiveSamples = (inputData: Float32Array) => {
         if (!this.isCapturing) return;
-
-        const inputData = e.inputBuffer.getChannelData(0);
 
         // Compute RMS audio level
         let sum = 0;
@@ -246,7 +265,7 @@ export class AudioCaptureService {
           this.sampleBuffer.push(downsampled[i]);
         }
 
-        if (rms >= 0.002) {
+        if (rms >= AUDIBLE_RMS) {
           this.freshSpeech = true;
           this.trailingSilenceSamples = 0;
         } else {
@@ -255,12 +274,35 @@ export class AudioCaptureService {
         this.queueReadyChunks();
       };
 
-      this.source.connect(this.processor);
-      this.processor.connect(this.audioContext.destination);
+      try {
+        await this.audioContext.audioWorklet.addModule('/audio-capture-worklet.js');
+        if (captureSession !== this.sessionId) return false;
+        this.worklet = new AudioWorkletNode(this.audioContext, 'toeic-capture');
+        this.worklet.port.onmessage = ({ data }) => {
+          if (data === 'flushed') this.flushWorklet?.();
+          else if (data instanceof Float32Array) receiveSamples(data);
+        };
+        this.worklet.onprocessorerror = () => this.onError?.('Bộ thu âm bị gián đoạn. Hãy dừng và bật microphone lại.');
+        highPass.connect(this.worklet);
+        this.worklet.connect(this.audioContext.destination);
+      } catch {
+        if (captureSession !== this.sessionId) return false;
+        // Compatibility path for browsers that cannot load AudioWorklet.
+        this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+        this.processor.onaudioprocess = e => receiveSamples(e.inputBuffer.getChannelData(0));
+        highPass.connect(this.processor);
+        this.processor.connect(this.audioContext.destination);
+      }
+
+      stream.getAudioTracks().forEach(track => {
+        track.onended = () => this.onError?.('Nguồn âm thanh đã ngắt. Hãy kết nối lại microphone hoặc âm thanh tab.');
+      });
 
       return true;
     } catch (err) {
+      if (captureSession !== this.sessionId) return false;
       console.error('AudioContext init error:', err);
+      await this.stop(false);
       this.onError?.('Không thể khởi tạo Web Audio API.');
       return false;
     }
@@ -280,7 +322,8 @@ export class AudioCaptureService {
       this.freshSpeech = false;
     }
 
-    if (this.freshSpeech && this.trailingSilenceSamples >= PAUSE_SAMPLES) {
+    if (this.freshSpeech && this.trailingSilenceSamples >= PAUSE_SAMPLES &&
+        this.sampleBuffer.length - this.retainedSamples >= MIN_PAUSE_CHUNK_SAMPLES) {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer),
         sessionId: this.sessionId,
@@ -314,7 +357,8 @@ export class AudioCaptureService {
   private processQueue(): Promise<void> {
     if (this.queueDrainPromise) return this.queueDrainPromise;
 
-    const drainPromise = this.drainQueue();
+    // Set the promise before draining, including when every chunk is silence.
+    const drainPromise = Promise.resolve().then(() => this.drainQueue());
     this.queueDrainPromise = drainPromise;
     return drainPromise.finally(() => {
       if (this.queueDrainPromise === drainPromise) this.queueDrainPromise = null;
@@ -337,55 +381,74 @@ export class AudioCaptureService {
     // Avoid asking Whisper to invent text from digital silence or a tiny click.
     if (!hasAudibleAudio(chunk.samples)) return;
 
-    const controller = new AbortController();
-    this.activeRequest = controller;
+    const wavBlob = encodeWav(normalizeAudio(chunk.samples), TARGET_SAMPLE_RATE);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (chunk.sessionId !== this.sessionId) return;
+      const controller = new AbortController();
+      this.activeRequest = controller;
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      let retryable = true;
+      try {
+        const formData = new FormData();
+        formData.append('file', wavBlob, 'audio.wav');
+        formData.append('context', this.committedTranscript.slice(-400));
 
-    try {
-      const wavBlob = encodeWav(chunk.samples, TARGET_SAMPLE_RATE);
-      const formData = new FormData();
-      formData.append('file', wavBlob, 'audio.wav');
+        const res = await fetch('/api/transcribe', {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
 
-      const res = await fetch('/api/transcribe', {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
+        if (res.ok) {
+          const data: { text?: string } = await res.json();
+          const text = data.text?.trim();
 
-      if (res.ok) {
-        const data: { text?: string } = await res.json();
-        const text = data.text?.trim();
-
-        if (text && chunk.sessionId === this.sessionId && !this.isSilenceArtifact(text)) {
-          const novelText = removeTranscriptOverlap(this.committedTranscript, text);
-          if (novelText) {
-            this.committedTranscript = `${this.committedTranscript} ${novelText}`.trim().slice(-2000);
-            this.onTranscript?.(novelText);
+          if (text && chunk.sessionId === this.sessionId && !/^\.+$/.test(text)) {
+            const novelText = removeTranscriptOverlap(this.committedTranscript, text);
+            if (novelText) {
+              this.committedTranscript = `${this.committedTranscript} ${novelText}`.trim().slice(-2000);
+              this.onTranscript?.(novelText);
+            }
           }
+          return;
+        } else {
+          retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+          throw new Error(`HTTP ${res.status}`);
         }
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        console.warn('Transcribe endpoint error:', errData);
+      } catch (err) {
+        if (chunk.sessionId !== this.sessionId) return;
+        if (!retryable || attempt === 2) {
+          console.warn('Transcription failed after retries:', err);
+          this.onError?.('Không nhận dạng được một đoạn âm thanh sau khi thử lại. Kiểm tra mạng/API và phát lại đoạn vừa nghe.');
+          return;
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (this.activeRequest === controller) this.activeRequest = null;
       }
-    } catch (err) {
-      if (!(err instanceof DOMException && err.name === 'AbortError')) {
-        console.warn('Failed to send audio for transcription:', err);
-      }
-    } finally {
-      if (this.activeRequest === controller) this.activeRequest = null;
+      await new Promise(resolve => setTimeout(resolve, 400 * (attempt + 1)));
     }
   }
 
-  private isSilenceArtifact(text: string): boolean {
-    return (
-      /^thank you[\.!]?$/i.test(text) ||
-      /^thanks for watching[\.!]?$/i.test(text) ||
-      /^you$/i.test(text) ||
-      /^\.+$/.test(text)
-    );
-  }
-
-  stop(flushPending = true): Promise<void> {
+  async stop(flushPending = true): Promise<void> {
+    const stoppingSession = this.sessionId;
+    if (flushPending && this.worklet && this.isCapturing) {
+      await new Promise<void>(resolve => {
+        const timeout = setTimeout(resolve, 200);
+        this.flushWorklet = () => { clearTimeout(timeout); resolve(); };
+        this.worklet!.port.postMessage('flush');
+      });
+    }
+    if (stoppingSession !== this.sessionId) return;
     this.isCapturing = false;
+    this.flushWorklet = null;
+    if (this.worklet) {
+      this.worklet.port.onmessage = null;
+      this.worklet.onprocessorerror = null;
+      this.worklet.disconnect();
+      this.worklet.port.close();
+      this.worklet = null;
+    }
 
     if (this.processor) {
       try {

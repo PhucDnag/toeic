@@ -44,7 +44,7 @@ export async function POST(request: NextRequest) {
         temperature: 0.0,
         response_format: 'verbose_json',
         timestamp_granularities: ['segment'],
-      });
+      }, { signal: request.signal });
     };
 
     let transcription;
@@ -52,22 +52,24 @@ export async function POST(request: NextRequest) {
       try {
         transcription = await withGroqKeyFailover((apiKey) =>
           transcribe(
-            new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1' }),
+            new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1', timeout: 12000, maxRetries: 0 }),
             'whisper-large-v3'
           )
         );
       } catch (error) {
         if (!(error instanceof GroqKeyPoolExhaustedError) || !hasOpenAIKey) throw error;
         console.warn('All Groq transcription keys are unavailable; using OpenAI fallback.');
-        transcription = await transcribe(new OpenAI({ apiKey: openaiKey }), 'whisper-1');
+        transcription = await transcribe(new OpenAI({ apiKey: openaiKey, timeout: 12000, maxRetries: 0 }), 'whisper-1');
       }
     } else {
-      transcription = await transcribe(new OpenAI({ apiKey: openaiKey }), 'whisper-1');
+      transcription = await transcribe(new OpenAI({ apiKey: openaiKey, timeout: 12000, maxRetries: 0 }), 'whisper-1');
     }
 
     const reliableSegments = transcription.segments?.filter((segment) => {
-      const likelySilence = segment.no_speech_prob > 0.6 && segment.avg_logprob < -1;
-      const likelyRepetition = segment.compression_ratio > 2.4;
+      // Quiet speaker audio and repeated TOEIC phrases are not silence by
+      // themselves. Reject only when multiple confidence signals agree.
+      const likelySilence = segment.no_speech_prob > 0.85 && segment.avg_logprob < -1.5;
+      const likelyRepetition = segment.compression_ratio > 2.4 && segment.avg_logprob < -1;
       return !likelySilence && !likelyRepetition;
     });
     const reliableText = reliableSegments?.map((segment) => segment.text.trim()).join(' ').trim();

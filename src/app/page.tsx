@@ -27,7 +27,6 @@ export default function Home() {
     clearError,
     forceSolve,
     feedTranscript,
-    runDemoSimulation,
     isSpeechAvailable,
   } = useTOEIC();
 
@@ -71,7 +70,6 @@ export default function Home() {
           <StartScreen
             onStart={startListening}
             onStartTabAudio={startTabAudioListening}
-            onDemo={runDemoSimulation}
             isSpeechAvailable={isSpeechAvailable}
             lastError={lastError}
           />
@@ -96,7 +94,6 @@ export default function Home() {
                     interimTranscript={interimTranscript}
                     isListening={isListening}
                     onFeedText={feedTranscript}
-                    onRunDemo={runDemoSimulation}
                   />
                 </div>
                 {/* History — Bottom of left panel */}

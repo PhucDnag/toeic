@@ -1,12 +1,14 @@
 // Normalize only announced numbers, never numbers inside the passage itself.
 export function normalizeListeningNumbers(text: string): string {
   const units = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
-  const tens = ['thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
-  const number = `(?:one[ -]hundred|(?:${tens.join('|')})(?:[ -](?:${units.join('|')}))?)`;
+  const tens = ['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+  const small = [...units, 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+  const number = `(?:one[ -]hundred|(?:${tens.join('|')})(?:[ -](?:${units.join('|')}))?|${small.join('|')})`;
   const convert = (value: string) => {
     if (/hundred/i.test(value)) return '100';
+    if (small.includes(value.toLowerCase())) return String(small.indexOf(value.toLowerCase()) + 1);
     const [ten, unit] = value.toLowerCase().split(/[ -]/);
-    return String((tens.indexOf(ten) + 3) * 10 + units.indexOf(unit) + 1);
+    return String((tens.indexOf(ten) + 2) * 10 + units.indexOf(unit) + 1);
   };
   return text.replace(new RegExp(`\\b(questions?|numbers?)\\s+(${number})\\b(?:\\s+(through|to|and)\\s+(${number})\\b)?`, 'gi'),
     (_, label: string, first: string, separator?: string, last?: string) =>

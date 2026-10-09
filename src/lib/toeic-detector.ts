@@ -2,16 +2,20 @@
 // Rule-based detection of TOEIC question patterns from live transcript
 
 import { DetectionResult, TOEICChoices, TOEICListeningPart } from './types';
+import { normalizeListeningNumbers } from './listening-groups';
 
 // ===== Question Pattern Detection =====
 
-const QUESTION_PATTERNS = [
-  // Deliberately exclude plural range headers such as "Questions 71 through
-  // 73". Those introduce a passage; they are not question 71 itself.
-  /(?:question|number|no\.?|#)\s*(\d{1,3})\b(?!\s*(?:through|to|and|-)\s*\d+)/i,
-  // Standalone numbers at start of line or sentence: "71." or "71)"
-  /(?:^|\n|\.\s+)\s*#?\s*(\d{1,3})\s*[\.\)]/,
-];
+// Only actual TOEIC listening numbers are eligible. Bare numeric noise such
+// as "3. 2. 3. 2." cannot become a question, and a bare number needs speech.
+export function questionMarkers(text: string) {
+  const pattern = /\b(?:question|number|no\.?|#)\s*(\d{1,3})\b(?!\s*(?:through|to|and|-)\s*\d+)\s*[.):\-]?|(?:^|[\n.!?]\s+)\s*(\d{1,3})\s*[.)]\s*(?=[A-Za-z][a-z])/gi;
+  return [...text.matchAll(pattern)].map(match => ({
+    number: Number(match[1] || match[2]),
+    start: match.index!,
+    end: match.index! + match[0].length,
+  })).filter(marker => marker.number >= 7 && marker.number <= 100);
+}
 
 /** Standard TOEIC Listening question-number ranges. */
 export function inferTOEICPart(questionNumber: number): TOEICListeningPart | undefined {
@@ -61,68 +65,17 @@ const QUESTION_KEYWORDS = [
   /according\s+to\s+the\s+(?:speaker|announcement|message|talk|report|advertisement)/i,
 ];
 
-// Spoken word numbers map (common in TOEIC like "number seventy one")
-const SPOKEN_NUMBERS: Record<string, number> = {
-  'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
-  'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
-  'thirty': 30, 'forty': 40, 'fifty': 50, 'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
-};
-
-function parseSpokenNumber(text: string): number | null {
-  const match = text.match(/(?:question|number)\s+([a-z\- ]+)/i);
-  if (!match) return null;
-  const words = match[1].toLowerCase().replace('-', ' ').trim().split(/\s+/);
-  let total = 0;
-  for (const w of words) {
-    if (SPOKEN_NUMBERS[w] !== undefined) {
-      total += SPOKEN_NUMBERS[w];
-    } else {
-      return null;
-    }
-  }
-  return total >= 1 && total <= 200 ? total : null;
-}
-
-/**
- * Detect question numbers from transcript text.
- */
 export function detectQuestionNumber(text: string): number | null {
-  for (const pattern of QUESTION_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) {
-      const num = parseInt(match[1], 10);
-      if (num >= 1 && num <= 200) {
-        return num;
-      }
-    }
-  }
-  return parseSpokenNumber(text);
+  return questionMarkers(normalizeListeningNumbers(text))[0]?.number ?? null;
 }
 
 function getQuestionSegment(text: string, questionNumber?: number | null): string | null {
   if (!questionNumber) return null;
-
-  const numericMarker = new RegExp(
-    `(?:question|number|no\\.?)\\s*${questionNumber}\\b\\s*[\\.\\):\\-]?`,
-    'gi'
-  );
-  let segmentStart = -1;
-  let numericMatch: RegExpExecArray | null;
-  while ((numericMatch = numericMarker.exec(text)) !== null) {
-    segmentStart = numericMatch.index + numericMatch[0].length;
-  }
-
-  // Also support "Number seventy one" when Whisper spells the number out.
-  const spokenMarker = /\b(?:question|number)\s+[a-z-]+(?:\s+[a-z-]+){0,2}\s*[\.\):\-]?/gi;
-  let spokenMatch: RegExpExecArray | null;
-  while ((spokenMatch = spokenMarker.exec(text)) !== null) {
-    if (parseSpokenNumber(spokenMatch[0]) === questionNumber) {
-      segmentStart = Math.max(segmentStart, spokenMatch.index + spokenMatch[0].length);
-    }
-  }
-
-  if (segmentStart < 0) return null;
-  return text.slice(segmentStart).trim();
+  const normalized = normalizeListeningNumbers(text);
+  const markers = questionMarkers(normalized);
+  const index = markers.findIndex(marker => marker.number === questionNumber);
+  if (index < 0) return null;
+  return normalized.slice(markers[index].end, markers[index + 1]?.start).trim();
 }
 
 /**

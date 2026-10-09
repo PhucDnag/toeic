@@ -97,6 +97,88 @@ test('Part 2 still collects A/B/C and chooses a letter', async t => {
   machine.stop();
 });
 
+test('continuous Part 2 solves all 25 questions even when audio arrives while solving', async t => {
+  const { machine, calls } = setup(t);
+  const question = n => `Number ${n}. Where is office ${n}? A. On floor ${n}. B. Tomorrow morning. C. No thanks.`;
+  machine.processTranscript(question(7));
+  machine.processTranscript(Array.from({ length: 24 }, (_, i) => question(i + 8)).join(' '));
+  for (let n = 7; n <= 31; n++) {
+    await settle(t);
+    assert.equal(calls.at(-1).questionNumber, n);
+    assert.equal(calls.at(-1).choices.A, `On floor ${n}.`);
+    assert.equal(calls.at(-1).choices.C, 'No thanks.');
+    t.mock.timers.tick(2500);
+  }
+  assert.equal(calls.length, 25);
+  machine.stop();
+});
+
+test('numeric noise from the screenshot never locks question detection', async t => {
+  const { machine, calls } = setup(t);
+  machine.processTranscript('Number 9. Would you like help? A. Knives and forks. B. I can manage it alone, thanks. C. No thanks.');
+  await settle(t);
+  machine.processTranscript('C. N. N. 2. 3. 2. In the Daily Newspaper. B. 3. 2. 3. 2. 2. 2. 2.');
+  t.mock.timers.tick(2500);
+  assert.equal(machine.getContext().currentQuestion, null);
+  machine.processTranscript("Number 10. There aren't enough seats for everyone. A. I'm not sure. B. It was very comfortable. C. I'll get some extra chairs.");
+  await settle(t);
+  assert.deepEqual(calls.map(q => q.questionNumber), [9, 10]);
+  assert.equal(calls[1].choices.C, "I'll get some extra chairs.");
+  machine.stop();
+});
+
+test('an empty numbered question is skipped when the next valid question arrives', async t => {
+  const { machine, calls } = setup(t);
+  machine.processTranscript('Number 10.');
+  machine.processTranscript('Number eleven. When is lunch? A. At noon. B. Over there. C. No thanks.');
+  await settle(t);
+  assert.deepEqual(calls.map(q => q.questionNumber), [11]);
+  assert.equal(machine.getContext().history[0].questionNumber, 10);
+  assert.equal(machine.getContext().history[0].answer, undefined);
+  machine.stop();
+});
+
+test('choice continuation updates even when the number of choices has not changed', async t => {
+  const { machine, calls } = setup(t);
+  machine.processTranscript('Number twelve. Where is the meeting? A. Upstairs. B. On');
+  machine.processTranscript('Monday morning.');
+  assert.equal(machine.getContext().currentQuestion.choices.B, 'On Monday morning.');
+  machine.processTranscript('C. At the reception desk.');
+  await settle(t);
+  assert.equal(calls[0].choices.B, 'On Monday morning.');
+  machine.stop();
+});
+
+test('Part 2 to Part 3 transition preserves the next passage in the same chunk', async t => {
+  const { machine, calls } = setup(t);
+  machine.processTranscript('Number 31. Is the office open? A. Yes it is. B. Tomorrow. C. At noon. Questions 32 through 34 refer to the following conversation. Welcome to the clinic. Number 32. Where are the speakers?');
+  await settle(t); t.mock.timers.tick(2500); await settle(t);
+  assert.deepEqual(calls.map(q => q.questionNumber), [31, 32]);
+  assert.equal(calls[1].passage, 'Welcome to the clinic.');
+  machine.stop();
+});
+
+test('a hung solver times out and questions heard during error recovery are retained', async t => {
+  const { machine, calls } = setup(t);
+  machine.setSolveCallback(q => {
+    calls.push(q);
+    if (q.questionNumber === 7) return new Promise(() => {});
+    return Promise.resolve({ questionNumber: q.questionNumber, answer: 'A', confidence: 0.9 });
+  });
+  const question = n => `Number ${n}. Is it ready? A. Yes it is. B. Yesterday. C. Over there.`;
+  machine.processTranscript(question(7));
+  await settle(t);
+  machine.processTranscript(question(8));
+  t.mock.timers.tick(30000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(machine.getContext().appState, 'ERROR');
+  machine.processTranscript(question(9));
+  t.mock.timers.tick(3000); await settle(t);
+  t.mock.timers.tick(2500); await settle(t);
+  assert.deepEqual(calls.map(q => q.questionNumber), [7, 8, 9]);
+  machine.stop();
+});
+
 test('solve route asks for content and never returns a fabricated letter for Part 3/4', async () => {
   const captured = [];
   class FakeOpenAI {
