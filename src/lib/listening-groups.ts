@@ -1,0 +1,30 @@
+// Normalize only announced numbers, never numbers inside the passage itself.
+export function normalizeListeningNumbers(text: string): string {
+  const units = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+  const tens = ['thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+  const number = `(?:one[ -]hundred|(?:${tens.join('|')})(?:[ -](?:${units.join('|')}))?)`;
+  const convert = (value: string) => {
+    if (/hundred/i.test(value)) return '100';
+    const [ten, unit] = value.toLowerCase().split(/[ -]/);
+    return String((tens.indexOf(ten) + 3) * 10 + units.indexOf(unit) + 1);
+  };
+  return text.replace(new RegExp(`\\b(questions?|numbers?)\\s+(${number})\\b(?:\\s+(through|to|and)\\s+(${number})\\b)?`, 'gi'),
+    (_, label: string, first: string, separator?: string, last?: string) =>
+      `${label} ${convert(first)}${last ? ` ${separator} ${convert(last)}` : ''}`);
+}
+
+export function listeningMarkers(text: string) {
+  const pattern = /\b(?:question|number|no\.?)\s*(\d{1,3})\b\s*[.):\-]?|(?:^|[\n.!?]\s+)\s*(\d{2,3})\s*[.)]/gi;
+  return [...text.matchAll(pattern)].map(match => ({
+    number: Number(match[1] || match[2]),
+    start: match.index!,
+    end: match.index! + match[0].length,
+  })).filter(marker => marker.number >= 32 && marker.number <= 100);
+}
+
+export const GROUP_HEADER = /\b(?:questions|numbers)\s+(\d+)\s*(?:through|to|and|-)\s*(\d+)\s+refer\s+to\s+the\s+following\s+[^.!?]+[.!?]/i;
+
+export function listeningGroupStart(number: number) {
+  const base = number < 71 ? 32 : 71;
+  return base + Math.floor((number - base) / 3) * 3;
+}
