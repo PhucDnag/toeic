@@ -69,7 +69,7 @@ test('failed chunk is retried before the following chunk and genuine Thank you i
   await service.processQueue();
   assert.equal(requests, 3);
   assert.deepEqual(transcripts, ['Thank you.', 'Number 32. Where are the speakers?']);
-  assert.equal(contexts[2], 'Thank you.');
+  assert.equal(contexts[2], null, 'old responses must not be fed back into Whisper as a prompt');
 });
 
 test('a permanent API failure is visible instead of silently losing audio', async t => {
@@ -128,4 +128,111 @@ test('stop preserves a short tail and does not resend overlap alone', async () =
   tail.sampleBuffer = new Array(1000).fill(0.1);
   await tail.stop();
   assert.equal(tail.pendingChunks.length, 1);
+});
+
+test('long backlog is batched in order without dropping or duplicating PCM samples', async () => {
+  const service = fixture();
+  // Simulate one minute of captured speech while the network was occupied.
+  const samples = Array.from({ length: 16000 * 60 }, (_, i) => i);
+  service.sampleBuffer = samples;
+  service.queueReadyChunks();
+  await service.queueFinalChunk();
+  const originalCount = service.pendingChunks.length;
+  const batches = [];
+  service.transcribeChunk = async chunk => batches.push(chunk);
+  await service.drainQueue();
+  assert.ok(batches.length < originalCount / 2);
+  assert.ok(batches.every(chunk => chunk.samples.length <= 16000 * 12));
+  const reconstructed = batches.flatMap(chunk => [...chunk.samples.subarray(chunk.overlapSamples)]);
+  assert.deepEqual(reconstructed, samples);
+});
+
+test('pending remains true through slow requests and until buffered speech is flushed', async t => {
+  const service = new AudioCaptureService();
+  const events = [];
+  let finish;
+  service.setPendingCallback(pending => events.push(pending));
+  t.mock.method(globalThis, 'fetch', () => new Promise(resolve => { finish = resolve; }));
+  service.pendingChunks = [{ samples: new Float32Array(16000).fill(0.01), sessionId: 0 }];
+  const draining = service.processQueue();
+  await new Promise(resolve => setImmediate(resolve));
+  service.sampleBuffer = new Array(4000).fill(0.01);
+  service.freshSpeech = true;
+  finish(Response.json({ text: 'A. Upstairs.' }));
+  await draining;
+  assert.deepEqual(events, [true]);
+  const stopping = service.stop();
+  await new Promise(resolve => setImmediate(resolve));
+  finish(Response.json({ text: 'B. Tomorrow.' }));
+  await stopping;
+  assert.deepEqual(events, [true, false]);
+});
+
+test('rate limits retain the same audio until Retry-After and preserve request order', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const service = new AudioCaptureService();
+  const transcripts = [];
+  const uploads = [];
+  service.setCallbacks(text => transcripts.push(text), () => {}, () => {});
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    uploads.push(Buffer.from(await options.body.get('file').arrayBuffer()));
+    if (uploads.length === 1) return new Response('{}', { status: 429, headers: { 'Retry-After': '30' } });
+    return Response.json({ text: uploads.length === 2 ? 'A. Upstairs.' : 'B. Tomorrow.' });
+  });
+  service.pendingChunks = [0.01, 0.02].map(value => ({ samples: new Float32Array(16000).fill(value), sessionId: 0 }));
+  const draining = service.processQueue();
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(29999);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(uploads.length, 1);
+  t.mock.timers.tick(1);
+  await draining;
+  assert.deepEqual(uploads[0], uploads[1]);
+  assert.deepEqual(transcripts, ['A. Upstairs.', 'B. Tomorrow.']);
+});
+
+test('reset cancels a rate-limit wait without emitting an old transcript', async t => {
+  const service = new AudioCaptureService();
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () =>
+    new Response('{}', { status: 429, headers: { 'Retry-After': '300' } }));
+  service.setCallbacks(() => assert.fail('stale transcript'), () => {}, () => {});
+  service.pendingChunks = [{ samples: new Float32Array(16000).fill(0.01), sessionId: 0 }];
+  const draining = service.processQueue();
+  await new Promise(resolve => setImmediate(resolve));
+  await service.stop(false);
+  await draining;
+  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(service.transcriptionPending, false);
+});
+
+test('pause boundary does not replay the previous spoken response', () => {
+  const service = fixture();
+  service.sampleBuffer = [...new Array(16000).fill(0.1), ...new Array(5600).fill(0)];
+  service.freshSpeech = true;
+  service.trailingSilenceSamples = 5600;
+  service.queueReadyChunks();
+  assert.equal(service.retainedSamples, 0);
+  assert.equal(service.sampleBuffer.length, 0);
+  service.sampleBuffer = [...new Array(16000).fill(0.2), ...new Array(5600).fill(0)];
+  service.freshSpeech = true;
+  service.queueReadyChunks();
+  assert.equal(service.pendingChunks[1].overlapSamples, 0);
+  assert.equal(service.pendingChunks[1].samples[0], Math.fround(0.2));
+});
+
+test('old overlap followed by silence never generates another transcription', async t => {
+  const service = new AudioCaptureService();
+  t.mock.method(globalThis, 'fetch', () => assert.fail('only old speech must not be uploaded'));
+  await service.transcribeChunk({ samples: Float32Array.from([...new Array(12800).fill(0.1), ...new Array(16000).fill(0)]), overlapSamples: 12800, sessionId: 0 });
+});
+
+test('timestamp-trimmed responses and nonoverlapping repeated replies are not text-deduplicated again', async t => {
+  const service = new AudioCaptureService();
+  const texts = [];
+  service.setCallbacks(text => texts.push(text), () => {}, error => assert.fail(error));
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ text: 'Thank you.', overlapRemoved: true }));
+  for (const overlapSamples of [0, 0, 12800]) {
+    await service.transcribeChunk({ samples: new Float32Array(32000).fill(0.01), overlapSamples, sessionId: 0 });
+  }
+  assert.deepEqual(texts, ['Thank you.', 'Thank you.', 'Thank you.']);
 });

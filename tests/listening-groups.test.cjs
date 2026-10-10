@@ -113,6 +113,41 @@ test('continuous Part 2 solves all 25 questions even when audio arrives while so
   machine.stop();
 });
 
+test('25 questions retain late choices and split C answers despite slow transcription', async t => {
+  const { machine, calls } = setup(t);
+  for (let n = 7; n <= 31; n++) {
+    machine.setTranscriptionPending(true);
+    machine.processTranscript(`Number ${n}. Where is office ${n}? A. Upstairs.`);
+    t.mock.timers.tick(20000);
+    await settle(t);
+    assert.equal(calls.length, n - 7, 'network delay must not solve a partial question');
+    machine.processTranscript('B. Tomorrow. C. Ask Jane.');
+    await settle(t);
+    assert.equal(calls.length, n - 7, 'punctuation from Whisper may precede more answer text');
+    machine.processTranscript('She knows the building.');
+    machine.setTranscriptionPending(false);
+    t.mock.timers.tick(1200);
+    await settle(t);
+    assert.equal(calls.at(-1).choices.C, 'Ask Jane. She knows the building.');
+    assert.equal(calls.at(-1).questionNumber, n);
+    t.mock.timers.tick(2500);
+  }
+  assert.equal(machine.getContext().history.length, 25);
+  machine.stop();
+});
+
+test('a gap between choice uploads never auto-solves missing B/C', async t => {
+  const { machine, calls } = setup(t);
+  machine.processTranscript('Number 7. Where is it? A. Upstairs.');
+  t.mock.timers.tick(30000);
+  await settle(t);
+  assert.equal(calls.length, 0);
+  machine.processTranscript('B. Tomorrow. C. At reception.');
+  await settle(t);
+  assert.equal(calls[0].choices.C, 'At reception.');
+  machine.stop();
+});
+
 test('numeric noise from the screenshot never locks question detection', async t => {
   const { machine, calls } = setup(t);
   machine.processTranscript('Number 9. Would you like help? A. Knives and forks. B. I can manage it alone, thanks. C. No thanks.');
@@ -200,4 +235,88 @@ test('solve route asks for content and never returns a fabricated letter for Par
     assert.ok(captured.at(-1).messages[1].content.includes('No answer choices are available'));
     assert.ok(!captured.at(-1).messages[1].content.includes('A. (not provided)'));
   }
+});
+
+test('transcription route exposes pool cooldown as 429 with Retry-After', async t => {
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(console, 'warn', () => {});
+  const previousKey = process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+  });
+  class PoolExhausted extends Error { retryAfterMs = 30500; }
+  const route = load('app/api/transcribe/route.ts', {
+    '@/lib/server/groq-key-pool': {
+      getGroqApiKeys: () => ['test'], GroqKeyPoolExhaustedError: PoolExhausted,
+      withGroqKeyFailover: async () => { throw new PoolExhausted('cooldown'); },
+    },
+  });
+  const form = new FormData();
+  form.append('file', new Blob(['audio']), 'audio.wav');
+  const response = await route.POST(new Request('http://localhost/api/transcribe', { method: 'POST', body: form }));
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get('Retry-After'), '31');
+});
+
+test('raw solve route bypasses choice formatting and returns answer content with a safe boundary', async () => {
+  const text = 'What dinner specials do you have today? We have baked salmon. For the first time. No I have not.';
+  let malformed = false;
+  const captured = [];
+  class FakeOpenAI {
+    chat = { completions: { create: async body => {
+      captured.push(body);
+      return { choices: [{ message: { content: JSON.stringify({
+        consumed_text: malformed ? 'made up boundary' : text,
+        answers: [{ part: 2, responses: ['We have baked salmon.', 'For the first time.', 'No I have not.'], question_number: null, question: 'What dinner specials do you have today?',
+          answer_text: 'We have baked salmon.', confidence: 0.9, reason: 'It names the special.', translation: 'Đây là món đặc biệt.' }],
+      }) } }] };
+    } } };
+  }
+  const route = load('app/api/solve/route.ts', {
+    openai: FakeOpenAI,
+    '@/lib/server/groq-key-pool': { getGroqApiKeys: () => ['test'], withGroqKeyFailover: fn => fn('test'), isGroqKeyUnavailableError: () => false },
+  });
+  const request = () => new Request('http://localhost/api/solve', { method: 'POST', body: JSON.stringify({ mode: 'raw', transcript: text }) });
+  const response = await route.POST(request());
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).answers[0].answer_text, 'We have baked salmon.');
+  assert.ok(!captured[0].messages[1].content.includes('(not provided)'));
+  assert.ok(captured[0].messages[0].content.includes('Leave incomplete trailing speech unconsumed'));
+  malformed = true;
+  assert.equal((await route.POST(request())).status, 500);
+});
+
+test('Groq-only solver tries the next key, then the next model, and returns cooldown when all are limited', async t => {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) if (/^GROQ_API_KEY/.test(name)) delete env[name];
+  env.GROQ_API_KEYS = 'first,second';
+  t.mock.property(process, 'env', env);
+  const pool = load('lib/server/groq-key-pool.ts', { 'server-only': {} });
+  const calls = [];
+  let limitAll = false;
+  class FakeGroq {
+    constructor(options) {
+      assert.equal(options.baseURL, 'https://api.groq.com/openai/v1');
+      this.chat = { completions: { create: async body => {
+        calls.push([body.model, options.apiKey]);
+        if (limitAll || body.model === 'openai/gpt-oss-120b') throw { status: 429, headers: new Headers({ 'retry-after': '10' }) };
+        return { choices: [{ message: { content: JSON.stringify({ answer: 'A', answer_text: 'At noon.' }) } }] };
+      } } };
+    }
+  }
+  const route = load('app/api/solve/route.ts', { openai: FakeGroq, '@/lib/server/groq-key-pool': pool });
+  const request = () => new Request('http://localhost/api/solve', { method: 'POST', body: JSON.stringify({ part: 2, question_number: 7, question: 'When is lunch?' }) });
+  assert.equal((await route.POST(request())).status, 200);
+  assert.deepEqual(calls.slice(0, 3), [
+    ['openai/gpt-oss-120b', 'first'], ['openai/gpt-oss-120b', 'second'], ['openai/gpt-oss-20b', 'first'],
+  ]);
+  limitAll = true;
+  const response = await route.POST(request());
+  assert.equal(response.status, 429);
+  assert.ok(Number(response.headers.get('Retry-After')) > 0);
+  const count = calls.length;
+  assert.equal((await route.POST(request())).status, 429);
+  assert.equal(calls.length, count, 'cooling keys must not be retried early');
 });

@@ -3,13 +3,22 @@ import 'server-only';
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 const INVALID_KEY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-let activeKeyIndex = 0;
+const activeKeyIndex = new Map<string, number>();
 const cooldownUntilByKey = new Map<string, number>();
+const invalidUntilByKey = new Map<string, number>();
+
+function deadline(key: string, scope: string) {
+  return Math.max(cooldownUntilByKey.get(`${scope}:${key}`) || 0, invalidUntilByKey.get(key) || 0);
+}
 
 export class GroqKeyPoolExhaustedError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly retryAfterMs: number;
+
+  constructor(message: string, options?: ErrorOptions & { scope?: string }) {
     super(message, options);
     this.name = 'GroqKeyPoolExhaustedError';
+    const deadlines = getGroqApiKeys().map(key => deadline(key, options?.scope || 'default'));
+    this.retryAfterMs = deadlines.length ? Math.max(0, Math.min(...deadlines) - Date.now()) : 0;
   }
 }
 
@@ -88,37 +97,34 @@ function retryDelayMs(error: unknown): number {
 }
 
 export async function withGroqKeyFailover<T>(
-  operation: (apiKey: string, keyNumber: number) => Promise<T>
+  operation: (apiKey: string, keyNumber: number) => Promise<T>,
+  scope = 'default'
 ): Promise<T> {
   const keys = getGroqApiKeys();
   if (keys.length === 0) {
     throw new GroqKeyPoolExhaustedError('No Groq API key is configured.');
   }
 
-  const now = Date.now();
-  const orderedIndexes = keys.map((_, offset) => (activeKeyIndex + offset) % keys.length);
-  const availableIndexes = orderedIndexes.filter(
-    (index) => (cooldownUntilByKey.get(keys[index]) || 0) <= now
-  );
-
-  if (availableIndexes.length === 0) {
-    throw new GroqKeyPoolExhaustedError('All configured Groq API keys are cooling down.');
-  }
+  const orderedIndexes = keys.map((_, offset) => ((activeKeyIndex.get(scope) || 0) + offset) % keys.length);
 
   let lastError: unknown;
-  for (const index of availableIndexes) {
+  for (const index of orderedIndexes) {
     const apiKey = keys[index];
+    if (deadline(apiKey, scope) > Date.now()) continue;
+    // Reserve the next starting key before awaiting so concurrent requests
+    // spread out, and a late success cannot clear another request's cooldown.
+    activeKeyIndex.set(scope, (index + 1) % keys.length);
     try {
       const result = await operation(apiKey, index + 1);
-      activeKeyIndex = index;
-      cooldownUntilByKey.delete(apiKey);
       return result;
     } catch (error) {
       if (!isGroqKeyUnavailableError(error)) throw error;
 
       lastError = error;
-      cooldownUntilByKey.set(apiKey, Date.now() + retryDelayMs(error));
-      activeKeyIndex = (index + 1) % keys.length;
+      const status = getErrorStatus(error);
+      const store = status === 401 || status === 403 ? invalidUntilByKey : cooldownUntilByKey;
+      const id = store === invalidUntilByKey ? apiKey : `${scope}:${apiKey}`;
+      store.set(id, Math.max(store.get(id) || 0, Date.now() + retryDelayMs(error)));
       console.warn(
         `Groq API key #${index + 1} is unavailable (HTTP ${getErrorStatus(error) || 'unknown'}); trying the next key.`
       );
@@ -127,7 +133,7 @@ export async function withGroqKeyFailover<T>(
 
   throw new GroqKeyPoolExhaustedError(
     'All configured Groq API keys have reached a limit or are unavailable.',
-    { cause: lastError }
+    { cause: lastError, scope }
   );
 }
 

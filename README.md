@@ -2,7 +2,8 @@
 
 Ứng dụng nghe và phân tích bài thi TOEIC Listening theo thời gian thực. Web hỗ trợ:
 
-- Part 2: nhận diện câu hỏi/câu nói và ba lựa chọn A, B, C.
+- Nghe văn bản thô và dùng AI tách từng câu theo nội dung, không bắt buộc đúng số câu hay nhãn A/B/C.
+- Part 2: trả nội dung phản hồi phù hợp sau khi nghe đủ các phản hồi, không dựng bảng lựa chọn bằng biểu thức chính quy.
 - Part 3 và Part 4: giữ nội dung hội thoại/bài nói làm ngữ cảnh cho từng nhóm ba câu và đưa ra gợi ý trả lời.
 - Thu âm qua microphone hoặc lấy âm thanh trực tiếp từ tab trình duyệt.
 - Chuyển giọng nói thành văn bản bằng Groq Whisper.
@@ -51,13 +52,7 @@ Các cách trên có thể dùng chung. Dự án tự loại bỏ key trùng l�
 
 Không đặt API key vào code phía client và không commit `.env.local` lên Git. File này đã được `.gitignore` bỏ qua.
 
-Có thể cấu hình thêm OpenAI để dự phòng cho cả nhận dạng âm thanh và giải câu hỏi:
-
-```env
-OPENAI_API_KEY=sk_your_openai_key
-```
-
-Groq vẫn là nhà cung cấp được ưu tiên khi có key hợp lệ.
+Ứng dụng chỉ dùng Groq cho cả nhận dạng âm thanh và giải câu hỏi. Các key được luân phiên sử dụng; key bị giới hạn sẽ được tạm bỏ qua theo thời gian Groq yêu cầu. Giới hạn được theo dõi riêng cho từng model để việc giải câu không chặn Whisper. Nếu các key của model giải câu đều bận, ứng dụng thử model Groq khác; khi tất cả đều bận, đoạn nghe được giữ và tự thử lại sau thời gian chờ.
 
 ## Chạy ở chế độ phát triển
 
@@ -90,6 +85,8 @@ Sau khi thay đổi `.env.local`, hãy dừng server bằng `Ctrl+C` rồi chạ
 Nếu không bật tùy chọn chia sẻ âm thanh, web sẽ không nhận được tiếng dù tab đã được chọn.
 
 ## Kiểm tra dự án
+
+Kiểm thử audio tổng hợp 9 câu qua API Groq thật (Windows, có sử dụng hạn mức API): chạy server tại cổng 3211, tạo WAV bằng `powershell.exe -NoProfile -File tests/create-audio-smoke.ps1`, rồi chạy `node tests/manual-audio-smoke.cjs <đường-dẫn-WAV>`. Bài thử kiểm tra toàn luồng chia audio, nhận dạng, câu trả lời gián tiếp và lịch sử không bị lặp. Đây là audio tổng hợp, không đo chất lượng thu qua loa/microphone.
 
 Chạy toàn bộ kiểm thử:
 
@@ -157,7 +154,7 @@ src/app/api/solve/       Phân tích và trả lời câu TOEIC
 src/components/          Các thành phần giao diện
 src/hooks/use-toeic.ts   Kết nối giao diện với luồng nghe
 src/lib/audio-capture.ts Thu, chia đoạn và gửi audio
-src/lib/state-machine.ts Điều phối nhận diện câu hỏi
+src/lib/raw-listening.ts Điều phối đoạn nghe thô, giữ phần chưa hoàn tất và lịch sử trả lời
 tests/                   Kiểm thử luồng audio, câu hỏi và key pool
 ```
 

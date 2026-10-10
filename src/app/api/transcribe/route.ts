@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI, { toFile } from 'openai';
+import { selectTranscript } from '@/lib/transcription';
 import {
   getGroqApiKeys,
   GroqKeyPoolExhaustedError,
@@ -10,18 +11,18 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
     const file = formData.get('file') as Blob | null;
-    const contextValue = formData.get('context');
-    const context = typeof contextValue === 'string' ? contextValue.slice(-500) : '';
+    const overlapSeconds = Number(formData.get('overlap_seconds') || 0);
+    if (!Number.isFinite(overlapSeconds) || overlapSeconds < 0 || overlapSeconds > 1) {
+      return NextResponse.json({ error: 'Invalid audio overlap' }, { status: 400 });
+    }
 
     if (!file || file.size === 0) {
       return NextResponse.json({ error: 'No audio provided' }, { status: 400 });
     }
 
-    const openaiKey = process.env.OPENAI_API_KEY;
-    const hasOpenAIKey = !!openaiKey && openaiKey !== 'your-openai-api-key-here';
     const hasGroqKeys = getGroqApiKeys().length > 0;
 
-    if (!hasGroqKeys && !hasOpenAIKey) {
+    if (!hasGroqKeys) {
       return NextResponse.json(
         { error: 'Chưa cấu hình GROQ_API_KEY/GROQ_API_KEYS để sử dụng Whisper AI.' },
         { status: 500 }
@@ -37,48 +38,27 @@ export async function POST(request: NextRequest) {
         file: uploadFile,
         model,
         language: 'en',
-        prompt: [
-          'TOEIC Listening Parts 2, 3, and 4. Transcribe exactly what is spoken. Preserve question numbers, contractions, speaker turns, and answer labels A, B, C, D. Part 2 has only A, B, C. Do not invent commentary.',
-          context ? `Possible preceding context: ${context}` : '',
-        ].filter(Boolean).join(' '),
         temperature: 0.0,
         response_format: 'verbose_json',
-        timestamp_granularities: ['segment'],
+        timestamp_granularities: overlapSeconds > 0 ? ['word', 'segment'] : ['segment'],
       }, { signal: request.signal });
     };
 
-    let transcription;
-    if (hasGroqKeys) {
-      try {
-        transcription = await withGroqKeyFailover((apiKey) =>
+    const transcription = await withGroqKeyFailover((apiKey) =>
           transcribe(
             new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1', timeout: 12000, maxRetries: 0 }),
             'whisper-large-v3'
-          )
-        );
-      } catch (error) {
-        if (!(error instanceof GroqKeyPoolExhaustedError) || !hasOpenAIKey) throw error;
-        console.warn('All Groq transcription keys are unavailable; using OpenAI fallback.');
-        transcription = await transcribe(new OpenAI({ apiKey: openaiKey, timeout: 12000, maxRetries: 0 }), 'whisper-1');
-      }
-    } else {
-      transcription = await transcribe(new OpenAI({ apiKey: openaiKey, timeout: 12000, maxRetries: 0 }), 'whisper-1');
-    }
+          ), 'whisper-large-v3');
 
-    const reliableSegments = transcription.segments?.filter((segment) => {
-      // Quiet speaker audio and repeated TOEIC phrases are not silence by
-      // themselves. Reject only when multiple confidence signals agree.
-      const likelySilence = segment.no_speech_prob > 0.85 && segment.avg_logprob < -1.5;
-      const likelyRepetition = segment.compression_ratio > 2.4 && segment.avg_logprob < -1;
-      return !likelySilence && !likelyRepetition;
-    });
-    const reliableText = reliableSegments?.map((segment) => segment.text.trim()).join(' ').trim();
-
-    // An empty filtered result must stay empty, otherwise rejected silence or
-    // repetition is accidentally restored by the fallback.
-    return NextResponse.json({ text: reliableText ?? transcription.text ?? '' });
+    return NextResponse.json(selectTranscript(transcription, overlapSeconds));
   } catch (error) {
     console.error('Whisper transcription error:', error);
+    if (error instanceof GroqKeyPoolExhaustedError && error.retryAfterMs > 0 && error.retryAfterMs <= 60 * 60 * 1000) {
+      return NextResponse.json(
+        { error: 'Dịch vụ nhận dạng đang giới hạn tốc độ. Đang giữ âm thanh để thử lại.' },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(error.retryAfterMs / 1000)) } }
+      );
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Transcription failed' },
       { status: 500 }

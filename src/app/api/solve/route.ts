@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { inferTOEICPart } from '@/lib/toeic-detector';
+import { RAW_LISTENING_PROMPT, validateListeningResult } from '@/lib/raw-listening-response';
 import {
   getGroqApiKeys,
-  isGroqKeyUnavailableError,
+  GroqKeyPoolExhaustedError,
   withGroqKeyFailover,
 } from '@/lib/server/groq-key-pool';
 
@@ -39,6 +40,11 @@ Respond in this exact JSON format:
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
+    const rawMode = body.mode === 'raw';
+    const rawTranscript = typeof body.transcript === 'string' ? body.transcript : '';
+    if (rawMode && (!rawTranscript.trim() || rawTranscript.length > 30000)) {
+      return NextResponse.json({ error: 'Invalid transcript length' }, { status: 400 });
+    }
 
     const { part, passage, question_number, question, choices } = body;
     const normalizedPassage = typeof passage === 'string' ? passage.trim() : '';
@@ -46,7 +52,7 @@ export async function POST(request: NextRequest) {
     const detectedPart = part || inferTOEICPart(Number(question_number));
     const isSuggestion = detectedPart === 3 || detectedPart === 4;
 
-    if (!normalizedQuestion && !normalizedPassage) {
+    if (!rawMode && !normalizedQuestion && !normalizedPassage) {
       return NextResponse.json(
         { error: 'Missing question and transcript' },
         { status: 400 }
@@ -55,18 +61,13 @@ export async function POST(request: NextRequest) {
 
     const safeChoices = choices || {};
 
-    // Provider priority: Groq key pool > Gemini > OpenAI.
     const hasGroqKeys = getGroqApiKeys().length > 0;
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
-    const hasGeminiKey = !!geminiKey && geminiKey !== 'your-gemini-api-key-here';
-    const hasOpenAIKey = !!openaiKey && openaiKey !== 'your-openai-api-key-here';
 
-    if (!hasGroqKeys && !hasGeminiKey && !hasOpenAIKey) {
+    if (!hasGroqKeys) {
       return NextResponse.json(
         {
           error:
-            'Chưa cấu hình API Key. Hãy thêm GROQ_API_KEY/GROQ_API_KEYS, GEMINI_API_KEY hoặc OPENAI_API_KEY trong .env.local',
+            'Chưa cấu hình GROQ_API_KEY/GROQ_API_KEYS trong .env.local',
         },
         { status: 500 }
       );
@@ -95,86 +96,49 @@ export async function POST(request: NextRequest) {
       userPrompt += '\nNo answer choices are available. Suggest the answer CONTENT to this question using only the passage. Set answer to null. If the passage is missing or insufficient, explicitly say so.\n';
     }
     userPrompt += `\nAnalyze the question against the passage and select the best answer. Respond in JSON only.`;
+    if (rawMode) {
+      userPrompt = JSON.stringify({
+        'PREVIOUS CONTEXT (already processed; do not answer again)': typeof body.context === 'string' ? body.context.slice(-12000) : '',
+        'NEW TRANSCRIPT': rawTranscript,
+      });
+    }
 
-    const generateWithModels = async (
-      client: OpenAI,
-      models: string[],
-      provider: string,
-      stopWhenKeyUnavailable = false
-    ): Promise<string> => {
-      let providerError: unknown;
-      for (const model of models) {
-        try {
+    let content: string | null = null;
+    let lastError: unknown;
+    const cooldowns: number[] = [];
+    // Exhaust available keys for a model before trying another Groq model.
+    for (const model of ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile']) {
+      try {
+        content = await withGroqKeyFailover(async apiKey => {
+          if (request.signal.aborted) throw new Error('Request cancelled');
+          const client = new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1', timeout: 12000, maxRetries: 0 });
           const completion = await client.chat.completions.create({
             model,
             messages: [
-              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'system', content: rawMode ? RAW_LISTENING_PROMPT : SYSTEM_PROMPT },
               { role: 'user', content: userPrompt },
             ],
             temperature: 0.1,
-            max_tokens: 500,
+            max_tokens: rawMode ? 4000 : 500,
             response_format: { type: 'json_object' },
-          });
+          }, { signal: request.signal });
           const result = completion.choices[0]?.message?.content;
           if (result) return result;
-        } catch (error) {
-          if (stopWhenKeyUnavailable && isGroqKeyUnavailableError(error)) throw error;
-          console.warn(`${provider} model ${model} failed, trying the next model.`, error);
-          providerError = error;
-        }
-      }
-      throw providerError instanceof Error
-        ? providerError
-        : new Error(`${provider} returned no model response.`);
-    };
-
-    let content: string | null = null;
-    let lastError: unknown = null;
-
-    if (hasGroqKeys) {
-      try {
-        content = await withGroqKeyFailover((apiKey) =>
-          generateWithModels(
-            new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1' }),
-            ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'],
-            'Groq',
-            true
-          )
-        );
+          throw new Error('Groq returned no response.');
+        }, model);
+        break;
       } catch (error) {
+        if (request.signal.aborted) throw error;
         lastError = error;
-        console.warn('Groq solver pool is unavailable; trying the next provider.');
-      }
-    }
-
-    if (!content && hasGeminiKey) {
-      try {
-        content = await generateWithModels(
-          new OpenAI({
-            apiKey: geminiKey,
-            baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
-          }),
-          ['gemini-2.0-flash', 'gemini-1.5-flash'],
-          'Gemini'
-        );
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    if (!content && hasOpenAIKey) {
-      try {
-        content = await generateWithModels(
-          new OpenAI({ apiKey: openaiKey }),
-          ['gpt-4o-mini', 'gpt-4o'],
-          'OpenAI'
-        );
-      } catch (error) {
-        lastError = error;
+        if (error instanceof GroqKeyPoolExhaustedError && error.retryAfterMs > 0 && error.retryAfterMs <= 3600000) cooldowns.push(error.retryAfterMs);
       }
     }
 
     if (!content) {
+      if (cooldowns.length) return NextResponse.json(
+        { error: 'Các key Groq đang giới hạn tốc độ. Đoạn nghe được giữ để tự động thử lại.' },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.min(...cooldowns) / 1000)) } }
+      );
       console.error('All candidate models failed. Last error:', lastError);
       return NextResponse.json(
         { error: 'No response from AI model' },
@@ -184,6 +148,7 @@ export async function POST(request: NextRequest) {
 
     try {
       const parsed = JSON.parse(content);
+      if (rawMode) return NextResponse.json(validateListeningResult(parsed, rawTranscript));
 
       // Validate required fields
       const response = {
@@ -208,7 +173,8 @@ export async function POST(request: NextRequest) {
       }
 
       return NextResponse.json(response);
-    } catch {
+    } catch (error) {
+      console.warn('Invalid solver response:', error instanceof Error ? error.message : 'invalid JSON');
       return NextResponse.json(
         { error: 'Failed to parse AI response' },
         { status: 500 }

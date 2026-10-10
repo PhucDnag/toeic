@@ -45,6 +45,18 @@ export class TOEICStateMachine {
   private deferredTranscriptBuffer = '';
   private currentPart: 2 | 3 | 4 | undefined;
   private sessionVersion = 0;
+  private transcriptionPending = false;
+
+  // Network latency is not a pause in the recording. Never finalize a partial
+  // answer while captured speech is still waiting for transcription.
+  setTranscriptionPending(pending: boolean) {
+    this.transcriptionPending = pending;
+    if (pending) this.clearAutoSolve();
+    else if (this.context.currentQuestion &&
+      (this.context.appState === 'QUESTION_DETECTED' || this.context.appState === 'WAITING_FOR_CHOICES')) {
+      this.scheduleAutoSolve(this.context.currentQuestion.part === 2 ? 1200 : 2500);
+    }
+  }
   
   // Debounce tracking
   private lastDetectedQuestionNum: number | null = null;
@@ -119,9 +131,12 @@ export class TOEICStateMachine {
     if (this.autoSolveTimer) {
       clearTimeout(this.autoSolveTimer);
     }
+    if (this.transcriptionPending) return;
     this.autoSolveTimer = setTimeout(() => {
       if (
+        !this.transcriptionPending &&
         this.context.currentQuestion &&
+        (this.context.currentQuestion.part !== 2 || hasRequiredChoices(this.context.currentQuestion.choices, 2)) &&
         (this.context.appState === 'QUESTION_DETECTED' ||
           this.context.appState === 'WAITING_FOR_CHOICES')
       ) {
@@ -249,7 +264,7 @@ export class TOEICStateMachine {
       return;
     }
     if (!text) return;
-    if (hasRequiredChoices(choices, 2) && /[.!?]["'’”]?$/.test(choices.C!.trim())) {
+    if (!this.transcriptionPending && hasRequiredChoices(choices, 2) && /[.!?]["'’”]?$/.test(choices.C!.trim())) {
       void this.handleQuestionComplete();
     } else {
       this.scheduleAutoSolve(hasRequiredChoices(choices, 2) ? 1200 : 6000);
@@ -449,6 +464,7 @@ export class TOEICStateMachine {
    */
   reset() {
     this.sessionVersion++;
+    this.transcriptionPending = false;
     this.context = {
       appState: 'IDLE',
       currentQuestion: null,

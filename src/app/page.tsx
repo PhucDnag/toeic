@@ -31,10 +31,7 @@ export default function Home() {
   } = useTOEIC();
 
   const isActive = appState !== 'IDLE';
-  const isListening =
-    appState === 'LISTENING' ||
-    appState === 'QUESTION_DETECTED' ||
-    appState === 'WAITING_FOR_CHOICES';
+  const isListening = microphoneState === 'CONNECTED';
 
   return (
     <div className="flex min-h-dvh flex-col overflow-x-hidden bg-zinc-950 text-white xl:h-dvh xl:overflow-hidden">

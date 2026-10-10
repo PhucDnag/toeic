@@ -10,6 +10,7 @@ const TARGET_SAMPLE_RATE = 16000;
 // Flush on a short pause instead of making every sentence wait ten seconds.
 // Continuous speech still gets bounded windows with context across boundaries.
 const CHUNK_SAMPLES = TARGET_SAMPLE_RATE * 4;
+const MAX_BATCH_SAMPLES = TARGET_SAMPLE_RATE * 12;
 const OVERLAP_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.8);
 const PAUSE_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.35);
 const MIN_FINAL_SAMPLES = Math.round(TARGET_SAMPLE_RATE * 0.05);
@@ -19,6 +20,7 @@ const AUDIBLE_RMS = 0.00015;
 interface AudioChunk {
   samples: Float32Array;
   sessionId: number;
+  overlapSamples?: number;
 }
 
 export function hasAudibleAudio(samples: Float32Array): boolean {
@@ -162,6 +164,21 @@ export class AudioCaptureService {
   private sessionId = 0;
   private activeRequest: AbortController | null = null;
   private committedTranscript = '';
+  private onPendingChange: ((pending: boolean) => void) | null = null;
+  private transcriptionPending = false;
+
+  setPendingCallback(callback: (pending: boolean) => void) {
+    this.onPendingChange = callback;
+  }
+
+  private updatePending() {
+    const pending = !!this.queueDrainPromise || this.pendingChunks.length > 0 ||
+      (this.freshSpeech && this.sampleBuffer.length > this.retainedSamples);
+    if (pending !== this.transcriptionPending) {
+      this.transcriptionPending = pending;
+      this.onPendingChange?.(pending);
+    }
+  }
 
   setCallbacks(
     onTranscript: TranscriptCallback,
@@ -315,6 +332,7 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer.slice(0, CHUNK_SAMPLES)),
         sessionId: this.sessionId,
+        overlapSamples: this.retainedSamples,
       });
       this.sampleBuffer = this.sampleBuffer.slice(stepSamples);
       this.hasQueuedChunk = true;
@@ -327,14 +345,18 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer),
         sessionId: this.sessionId,
+        overlapSamples: this.retainedSamples,
       });
-      this.sampleBuffer = this.sampleBuffer.slice(-OVERLAP_SAMPLES);
-      this.retainedSamples = this.sampleBuffer.length;
+      // This boundary is already in silence: replaying the previous response
+      // adds no context and lets Whisper repeat it as the next response.
+      this.sampleBuffer = [];
+      this.retainedSamples = 0;
       this.hasQueuedChunk = true;
       this.freshSpeech = false;
     }
 
     void this.processQueue();
+    this.updatePending();
   }
 
   private queueFinalChunk(): Promise<void> {
@@ -348,20 +370,25 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer),
         sessionId: this.sessionId,
+        overlapSamples: this.retainedSamples,
       });
     }
     this.sampleBuffer = [];
+    this.freshSpeech = false;
     return this.processQueue();
   }
 
   private processQueue(): Promise<void> {
     if (this.queueDrainPromise) return this.queueDrainPromise;
+    if (!this.pendingChunks.length) return Promise.resolve();
 
     // Set the promise before draining, including when every chunk is silence.
     const drainPromise = Promise.resolve().then(() => this.drainQueue());
     this.queueDrainPromise = drainPromise;
+    this.updatePending();
     return drainPromise.finally(() => {
       if (this.queueDrainPromise === drainPromise) this.queueDrainPromise = null;
+      this.updatePending();
     });
   }
 
@@ -370,6 +397,19 @@ export class AudioCaptureService {
       while (this.pendingChunks.length > 0) {
         const chunk = this.pendingChunks.shift();
         if (!chunk || chunk.sessionId !== this.sessionId) continue;
+        // Catch up after slow requests with fewer, longer uploads. Adjacent
+        // windows share PCM; include that overlap exactly once in the batch.
+        while (this.pendingChunks.length) {
+          const next = this.pendingChunks[0];
+          if (next.sessionId !== chunk.sessionId || next.overlapSamples === undefined) break;
+          const unique = next.samples.subarray(next.overlapSamples);
+          if (chunk.samples.length + unique.length > MAX_BATCH_SAMPLES) break;
+          const merged = new Float32Array(chunk.samples.length + unique.length);
+          merged.set(chunk.samples);
+          merged.set(unique, chunk.samples.length);
+          chunk.samples = merged;
+          this.pendingChunks.shift();
+        }
         await this.transcribeChunk(chunk);
       }
     } catch (err) {
@@ -379,7 +419,7 @@ export class AudioCaptureService {
 
   private async transcribeChunk(chunk: AudioChunk) {
     // Avoid asking Whisper to invent text from digital silence or a tiny click.
-    if (!hasAudibleAudio(chunk.samples)) return;
+    if (!hasAudibleAudio(chunk.samples.subarray(chunk.overlapSamples ?? 0))) return;
 
     const wavBlob = encodeWav(normalizeAudio(chunk.samples), TARGET_SAMPLE_RATE);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -388,10 +428,11 @@ export class AudioCaptureService {
       this.activeRequest = controller;
       const timeout = setTimeout(() => controller.abort(), 20000);
       let retryable = true;
+      let retryDelay = 400 * (attempt + 1);
       try {
         const formData = new FormData();
         formData.append('file', wavBlob, 'audio.wav');
-        formData.append('context', this.committedTranscript.slice(-400));
+        formData.append('overlap_seconds', String((chunk.overlapSamples ?? 0) / TARGET_SAMPLE_RATE));
 
         const res = await fetch('/api/transcribe', {
           method: 'POST',
@@ -400,11 +441,12 @@ export class AudioCaptureService {
         });
 
         if (res.ok) {
-          const data: { text?: string } = await res.json();
+          const data: { text?: string; overlapRemoved?: boolean } = await res.json();
           const text = data.text?.trim();
 
           if (text && chunk.sessionId === this.sessionId && !/^\.+$/.test(text)) {
-            const novelText = removeTranscriptOverlap(this.committedTranscript, text);
+            const novelText = !data.overlapRemoved && (chunk.overlapSamples ?? 0) > 0
+              ? removeTranscriptOverlap(this.committedTranscript, text) : text;
             if (novelText) {
               this.committedTranscript = `${this.committedTranscript} ${novelText}`.trim().slice(-2000);
               this.onTranscript?.(novelText);
@@ -413,6 +455,13 @@ export class AudioCaptureService {
           return;
         } else {
           retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+          if (res.status === 429) {
+            const retryAfter = res.headers.get('Retry-After');
+            const seconds = retryAfter ? Number(retryAfter) : NaN;
+            const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter || '') - Date.now();
+            retryDelay = Number.isFinite(delay) ? Math.max(1000, Math.min(delay, 3600000)) : 5000;
+            this.onError?.('Dịch vụ nhận dạng đang giới hạn tốc độ. Âm thanh đang được giữ để thử lại; bạn có thể tạm dừng bài nghe để chờ xử lý.');
+          }
           throw new Error(`HTTP ${res.status}`);
         }
       } catch (err) {
@@ -426,7 +475,17 @@ export class AudioCaptureService {
         clearTimeout(timeout);
         if (this.activeRequest === controller) this.activeRequest = null;
       }
-      await new Promise(resolve => setTimeout(resolve, 400 * (attempt + 1)));
+      // Reset/source changes must also cancel a provider cooldown immediately.
+      const retryController = new AbortController();
+      this.activeRequest = retryController;
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, retryDelay);
+        retryController.signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+      if (this.activeRequest === retryController) this.activeRequest = null;
     }
   }
 

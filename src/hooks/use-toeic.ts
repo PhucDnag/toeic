@@ -2,10 +2,10 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AppState, MicrophoneState, TOEICQuestion, AIAnswer, SessionHistoryItem } from '@/lib/types';
-import { TOEICStateMachine } from '@/lib/state-machine';
+import { RawListeningSession } from '@/lib/raw-listening';
 import { SpeechService } from '@/lib/speech';
 import { AudioCaptureService } from '@/lib/audio-capture';
-import { solveQuestion } from '@/lib/ai-client';
+import { solveListeningTranscript } from '@/lib/ai-client';
 
 export interface UseTOEICReturn {
   // State
@@ -54,14 +54,14 @@ export function useTOEIC(): UseTOEICReturn {
   const isSpeechAvailable = true;
   
   // Services
-  const stateMachineRef = useRef<TOEICStateMachine | null>(null);
+  const stateMachineRef = useRef<RawListeningSession | null>(null);
   const speechServiceRef = useRef<SpeechService | null>(null);
   const audioCaptureRef = useRef<AudioCaptureService | null>(null);
   const actionVersionRef = useRef(0);
   
   // Initialize services
   useEffect(() => {
-    const sm = new TOEICStateMachine();
+    const sm = new RawListeningSession();
     const speech = new SpeechService();
     const capture = new AudioCaptureService();
 
@@ -79,7 +79,7 @@ export function useTOEIC(): UseTOEICReturn {
     });
 
     // Set up AI solver
-    sm.setSolveCallback(solveQuestion);
+    sm.setSolveCallback(solveListeningTranscript);
 
     // Set up Universal Audio Capture (Groq Whisper AI + Waveform Level)
     capture.setCallbacks(
@@ -195,6 +195,9 @@ export function useTOEIC(): UseTOEICReturn {
     setMicrophoneState('NOT_CONNECTED');
 
     await capture?.stop();
+    if (actionVersion === actionVersionRef.current) {
+      await stateMachineRef.current?.flush();
+    }
     if (actionVersion === actionVersionRef.current) {
       stateMachineRef.current?.stop();
     }
