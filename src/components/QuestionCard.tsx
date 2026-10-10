@@ -15,7 +15,8 @@ export default function QuestionCard({ appState, question, answer, onForceSolve 
   const choiceLabels = question?.part === 2
     ? (['A', 'B', 'C'] as const)
     : (['A', 'B', 'C', 'D'] as const);
-  const isAnswerReady = appState === 'ANSWER_READY' && answer;
+  const isAnswerReady = answer && answer.questionNumber === question?.questionNumber &&
+    (appState === 'ANSWER_READY' || appState === 'LISTENING');
   const isSolving = appState === 'SOLVING';
   
   // Status text based on state
@@ -255,11 +256,6 @@ export default function QuestionCard({ appState, question, answer, onForceSolve 
                   <span className="text-2xl font-bold text-emerald-400">
                     {isSuggestion ? '' : answer.answer}
                   </span>
-                  {answer.confidence && (
-                    <span className="text-[10px] text-zinc-500 ml-auto">
-                      {Math.round(answer.confidence * 100)}% confidence
-                    </span>
-                  )}
                 </div>
                 <p className="mt-2 text-sm text-emerald-300/70">
                   {isSuggestion ? answer.answerText : answer.answer ? question.choices[answer.answer] : ''}

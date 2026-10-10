@@ -59,6 +59,8 @@ OPENAI_API_KEY=sk_your_openai_key
 
 Groq vẫn là nhà cung cấp được ưu tiên khi có key hợp lệ.
 
+Bộ giải dùng `qwen/qwen3.8-27b` với reasoning tắt, dự phòng bằng `openai/gpt-oss-20b` và `openai/gpt-oss-120b`. Chỉ trả đáp án ngắn. Model trả 403/404 được bỏ qua tạm thời; hạn mức giải câu hỏi được tách khỏi hạn mức nhận dạng để lỗi giải không khóa luồng Whisper.
+
 ## Chạy ở chế độ phát triển
 
 ```powershell
@@ -90,6 +92,14 @@ Sau khi thay đổi `.env.local`, hãy dừng server bằng `Ctrl+C` rồi chạ
 Nếu không bật tùy chọn chia sẻ âm thanh, web sẽ không nhận được tiếng dù tab đã được chọn.
 
 ## Kiểm tra dự án
+
+Kiểm tra tài khoản Groq thực tế (truy vấn danh sách model và gọi 3 câu ngắn, có sử dụng hạn mức API):
+
+```powershell
+npm run check:ai
+```
+
+Lệnh dùng key trong `.env.local`, không in key hoặc header xác thực.
 
 Chạy toàn bộ kiểm thử:
 

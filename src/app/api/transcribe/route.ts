@@ -10,8 +10,6 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
     const file = formData.get('file') as Blob | null;
-    const contextValue = formData.get('context');
-    const context = typeof contextValue === 'string' ? contextValue.slice(-500) : '';
 
     if (!file || file.size === 0) {
       return NextResponse.json({ error: 'No audio provided' }, { status: 400 });
@@ -37,10 +35,8 @@ export async function POST(request: NextRequest) {
         file: uploadFile,
         model,
         language: 'en',
-        prompt: [
-          'TOEIC Listening Parts 2, 3, and 4. Transcribe exactly what is spoken. Preserve question numbers, contractions, speaker turns, and answer labels A, B, C, D. Part 2 has only A, B, C. Do not invent commentary.',
-          context ? `Possible preceding context: ${context}` : '',
-        ].filter(Boolean).join(' '),
+        // Do not feed previous predictions back into Whisper: a bad phrase can
+        // otherwise seed the same hallucination throughout a long session.
         temperature: 0.0,
         response_format: 'verbose_json',
         timestamp_granularities: ['segment'],
@@ -54,7 +50,8 @@ export async function POST(request: NextRequest) {
           transcribe(
             new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1', timeout: 12000, maxRetries: 0 }),
             'whisper-large-v3'
-          )
+          ),
+          'transcribe'
         );
       } catch (error) {
         if (!(error instanceof GroqKeyPoolExhaustedError) || !hasOpenAIKey) throw error;

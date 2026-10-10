@@ -73,3 +73,24 @@ test('does not rotate keys for a request error unrelated to quota or credentials
   );
   assert.deepEqual(attempted, ['first']);
 });
+
+test('solver rate limits do not stop transcription with the same key', async () => {
+  configure({ GROQ_API_KEY: 'shared' });
+  const pool = loadPool();
+  await assert.rejects(pool.withGroqKeyFailover(async () => { throw { status: 429 }; }, 'solve'));
+  assert.equal(await pool.withGroqKeyFailover(async key => key, 'transcribe'), 'shared');
+  let called = false;
+  await assert.rejects(pool.withGroqKeyFailover(async () => { called = true; }, 'solve'));
+  assert.equal(called, false, 'chat scope must still honor its own cooldown');
+});
+
+test('endpoint permissions are isolated but invalid credentials are disabled globally', async () => {
+  configure({ GROQ_API_KEY: 'shared' });
+  const pool = loadPool();
+  await assert.rejects(pool.withGroqKeyFailover(async () => { throw { status: 403 }; }, 'solve'));
+  assert.equal(await pool.withGroqKeyFailover(async key => key, 'transcribe'), 'shared');
+  await assert.rejects(pool.withGroqKeyFailover(async () => { throw { status: 401 }; }, 'transcribe'));
+  let called = false;
+  await assert.rejects(pool.withGroqKeyFailover(async () => { called = true; }, 'another-scope'));
+  assert.equal(called, false);
+});

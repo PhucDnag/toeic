@@ -9,7 +9,7 @@ import { normalizeListeningNumbers } from './listening-groups';
 // Only actual TOEIC listening numbers are eligible. Bare numeric noise such
 // as "3. 2. 3. 2." cannot become a question, and a bare number needs speech.
 export function questionMarkers(text: string) {
-  const pattern = /\b(?:question|number|no\.?|#)\s*(\d{1,3})\b(?!\s*(?:through|to|and|-)\s*\d+)\s*[.):\-]?|(?:^|[\n.!?]\s+)\s*(\d{1,3})\s*[.)]\s*(?=[A-Za-z][a-z])/gi;
+  const pattern = /\b(?:question|number|no\.?|#)\s*(\d{1,3})\b(?!\s*(?:through|to|and|[-–—])\s*\d+)\s*[.):\-]?|(?:^|[\n.!?]\s+)\s*(\d{1,3})\s*[.)]\s*(?=[A-Za-z][a-z])/gi;
   return [...text.matchAll(pattern)].map(match => ({
     number: Number(match[1] || match[2]),
     start: match.index!,
@@ -75,7 +75,8 @@ function getQuestionSegment(text: string, questionNumber?: number | null): strin
   const markers = questionMarkers(normalized);
   const index = markers.findIndex(marker => marker.number === questionNumber);
   if (index < 0) return null;
-  return normalized.slice(markers[index].end, markers[index + 1]?.start).trim();
+  const next = markers.slice(index + 1).find(marker => marker.number !== questionNumber);
+  return normalized.slice(markers[index].end, next?.start).trim();
 }
 
 /**
@@ -114,10 +115,13 @@ export function detectQuestionText(text: string, questionNumber?: number | null)
     const choiceStart = numberedSegment.search(
       /(?:^|\s)(?:Choice\s+|Option\s+)?[A-D]\s*[\.\),:\-]/i
     );
-    const questionText = (choiceStart >= 0
-      ? numberedSegment.slice(0, choiceStart)
-      : numberedSegment
-    ).trim().replace(/^[\s.():-]+|[\s]+$/g, '');
+    const questionEnd = choiceStart >= 0 ? choiceStart : numberedSegment.length;
+    // Overlapping audio can produce "Number 7. 7. What ..." or repeat the
+    // entire header. Use the last header before A, not an empty first fragment.
+    const repeatedHeaders = questionMarkers(numberedSegment).filter(marker => marker.end <= questionEnd);
+    const questionStart = repeatedHeaders.at(-1)?.end ?? 0;
+    const questionText = numberedSegment.slice(questionStart, questionEnd)
+      .trim().replace(/^[\s.():-]+|[\s]+$/g, '');
 
     // Part 2 prompts can be statements, so do not require a question keyword.
     return questionText.length >= 3 ? questionText : null;
@@ -160,8 +164,9 @@ export function extractChoices(text: string, questionNumber?: number | null): TO
   
   while ((match = pattern.exec(choiceSource)) !== null) {
     const letter = match[1].toUpperCase() as keyof TOEICChoices;
-    const choiceText = match[2].trim();
-    if (choiceText.length >= 2) {
+    const repeatedHeader = questionMarkers(match[2])[0]?.start;
+    const choiceText = match[2].slice(0, repeatedHeader).trim();
+    if (choiceText.length >= 2 && !choices[letter]) {
       choices[letter] = choiceText;
     }
   }
@@ -172,7 +177,7 @@ export function extractChoices(text: string, questionNumber?: number | null): TO
     while ((match = loosePattern.exec(choiceSource)) !== null) {
       const letter = match[1].toUpperCase() as keyof TOEICChoices;
       const choiceText = match[2].trim();
-      if (choiceText.length >= 2) {
+      if (choiceText.length >= 2 && !choices[letter]) {
         choices[letter] = choiceText;
       }
     }

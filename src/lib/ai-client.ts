@@ -10,7 +10,7 @@ export async function solveQuestion(question: TOEICQuestion): Promise<AIAnswer> 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       part: question.part,
-      passage: question.passage || '',
+      passage: question.part === 3 || question.part === 4 ? question.passage || '' : '',
       question_number: question.questionNumber,
       question: question.questionText,
       choices: question.choices,
@@ -28,10 +28,5 @@ export async function solveQuestion(question: TOEICQuestion): Promise<AIAnswer> 
     questionNumber: data.question_number,
     answer: data.answer as AIAnswer['answer'],
     answerText: data.answer_text,
-    confidence: data.confidence,
-    questionType: data.question_type,
-    reason: data.reason,
-    translation: data.translation,
-    vocabulary: data.vocabulary || [],
   };
 }

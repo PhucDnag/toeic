@@ -19,6 +19,8 @@ const AUDIBLE_RMS = 0.00015;
 interface AudioChunk {
   samples: Float32Array;
   sessionId: number;
+  overlapsPrevious: boolean;
+  overlapSamples?: number;
 }
 
 export function hasAudibleAudio(samples: Float32Array): boolean {
@@ -30,7 +32,9 @@ export function hasAudibleAudio(samples: Float32Array): boolean {
     if (amplitude >= AUDIBLE_RMS) activeSamples++;
   }
 
-  const rms = Math.sqrt(energy / Math.max(1, samples.length));
+  // Measure the audible portion: leading/trailing pauses must not dilute a
+  // quiet sentence below the gate. Still require sustained sound, not a click.
+  const rms = Math.sqrt(energy / Math.max(1, activeSamples));
   const activeRatio = activeSamples / Math.max(1, samples.length);
   return rms >= AUDIBLE_RMS && activeRatio >= 0.01;
 }
@@ -43,8 +47,8 @@ export function normalizeAudio(samples: Float32Array): Float32Array {
     peak = Math.max(peak, Math.abs(sample));
   }
   const rms = Math.sqrt(energy / Math.max(1, samples.length));
-  if (!peak || rms < AUDIBLE_RMS) return samples;
-  const gain = Math.min(16, 0.06 / rms, 0.95 / peak);
+  if (peak < AUDIBLE_RMS || !rms) return samples;
+  const gain = Math.min(256, 0.06 / rms, 0.95 / peak);
   return samples.map(sample => sample * gain);
 }
 
@@ -180,7 +184,8 @@ export class AudioCaptureService {
           channelCount: { ideal: 1 },
           echoCancellation: false,
           noiseSuppression: false,
-          autoGainControl: true,
+          // Keep distant speaker audio intact; normalize each upload ourselves.
+          autoGainControl: false,
         },
       });
       return this.startWithStream(stream);
@@ -315,11 +320,13 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer.slice(0, CHUNK_SAMPLES)),
         sessionId: this.sessionId,
+        overlapsPrevious: this.hasAudibleOverlap(),
+        overlapSamples: this.retainedSamples,
       });
       this.sampleBuffer = this.sampleBuffer.slice(stepSamples);
       this.hasQueuedChunk = true;
       this.retainedSamples = OVERLAP_SAMPLES;
-      this.freshSpeech = false;
+      this.freshSpeech = hasAudibleAudio(new Float32Array(this.sampleBuffer.slice(this.retainedSamples)));
     }
 
     if (this.freshSpeech && this.trailingSilenceSamples >= PAUSE_SAMPLES &&
@@ -327,6 +334,8 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer),
         sessionId: this.sessionId,
+        overlapsPrevious: this.hasAudibleOverlap(),
+        overlapSamples: this.retainedSamples,
       });
       this.sampleBuffer = this.sampleBuffer.slice(-OVERLAP_SAMPLES);
       this.retainedSamples = this.sampleBuffer.length;
@@ -335,6 +344,11 @@ export class AudioCaptureService {
     }
 
     void this.processQueue();
+  }
+
+  private hasAudibleOverlap(): boolean {
+    return this.retainedSamples > 0 &&
+      hasAudibleAudio(new Float32Array(this.sampleBuffer.slice(0, this.retainedSamples)));
   }
 
   private queueFinalChunk(): Promise<void> {
@@ -348,6 +362,8 @@ export class AudioCaptureService {
       this.pendingChunks.push({
         samples: new Float32Array(this.sampleBuffer),
         sessionId: this.sessionId,
+        overlapsPrevious: this.hasAudibleOverlap(),
+        overlapSamples: this.retainedSamples,
       });
     }
     this.sampleBuffer = [];
@@ -370,6 +386,20 @@ export class AudioCaptureService {
       while (this.pendingChunks.length > 0) {
         const chunk = this.pendingChunks.shift();
         if (!chunk || chunk.sessionId !== this.sessionId) continue;
+        // Catch up after a slow request by transcribing adjacent queued audio
+        // together. Remove only their exact PCM overlap, never speech samples.
+        // Keep each upload bounded, preserving order and the first boundary.
+        while (this.pendingChunks.length) {
+          const next = this.pendingChunks[0];
+          if (next.sessionId !== chunk.sessionId || next.overlapSamples === undefined) break;
+          const tail = next.samples.subarray(next.overlapSamples);
+          if (chunk.samples.length + tail.length > TARGET_SAMPLE_RATE * 16) break;
+          const merged = new Float32Array(chunk.samples.length + tail.length);
+          merged.set(chunk.samples);
+          merged.set(tail, chunk.samples.length);
+          chunk.samples = merged;
+          this.pendingChunks.shift();
+        }
         await this.transcribeChunk(chunk);
       }
     } catch (err) {
@@ -391,7 +421,6 @@ export class AudioCaptureService {
       try {
         const formData = new FormData();
         formData.append('file', wavBlob, 'audio.wav');
-        formData.append('context', this.committedTranscript.slice(-400));
 
         const res = await fetch('/api/transcribe', {
           method: 'POST',
@@ -404,9 +433,13 @@ export class AudioCaptureService {
           const text = data.text?.trim();
 
           if (text && chunk.sessionId === this.sessionId && !/^\.+$/.test(text)) {
-            const novelText = removeTranscriptOverlap(this.committedTranscript, text);
+            const novelText = chunk.overlapsPrevious
+              ? removeTranscriptOverlap(this.committedTranscript, text)
+              : text;
             if (novelText) {
-              this.committedTranscript = `${this.committedTranscript} ${novelText}`.trim().slice(-2000);
+              // Only local boundary deduplication needs a short tail. Never
+              // send this predicted text back as recognition context.
+              this.committedTranscript = `${this.committedTranscript} ${novelText}`.trim().split(/\s+/).slice(-20).join(' ');
               this.onTranscript?.(novelText);
             }
           }

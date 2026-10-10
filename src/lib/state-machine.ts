@@ -19,6 +19,7 @@ import {
   inferTOEICPart,
 } from './toeic-detector';
 import { GROUP_HEADER, listeningGroupStart, listeningMarkers, normalizeListeningNumbers } from './listening-groups';
+import { QUESTIONS_PER_CLEANUP, trimTranscript } from './transcript-window';
 
 export type StateChangeCallback = (
   newState: AppState,
@@ -45,6 +46,8 @@ export class TOEICStateMachine {
   private deferredTranscriptBuffer = '';
   private currentPart: 2 | 3 | 4 | undefined;
   private sessionVersion = 0;
+  private completedSinceCleanup = 0;
+  private transcriptCleanupCallback: ((remainingText: string) => void) | null = null;
   
   // Debounce tracking
   private lastDetectedQuestionNum: number | null = null;
@@ -75,6 +78,20 @@ export class TOEICStateMachine {
   setSolveCallback(callback: (question: TOEICQuestion) => Promise<AIAnswer>) {
     this.solveCallback = callback;
   }
+
+  setTranscriptCleanupCallback(callback: (remainingText: string) => void) {
+    this.transcriptCleanupCallback = callback;
+  }
+
+  private compactCompletedTranscript() {
+    if (++this.completedSinceCleanup < QUESTIONS_PER_CLEANUP) return;
+    this.completedSinceCleanup = 0;
+    // Only discard completed text. Pending audio/text, duplicate-number guards,
+    // answer history and the active group's passage must survive maintenance.
+    const remaining = [this.questionDetectionBuffer, this.deferredTranscriptBuffer].filter(Boolean).join(' ').trim();
+    this.context.transcriptBuffer = trimTranscript(remaining);
+    this.transcriptCleanupCallback?.(this.context.transcriptBuffer);
+  }
   
   private emit() {
     for (const listener of this.listeners) {
@@ -99,10 +116,12 @@ export class TOEICStateMachine {
   
   start() {
     this.sessionVersion++;
+    this.completedSinceCleanup = 0;
     this.clearAutoSolve();
     this.context.currentPassage = null;
     this.context.currentQuestion = null;
     this.context.currentAnswer = null;
+    this.context.processedQuestions.clear();
     this.lastDetectedQuestionNum = null;
     this.lastChoiceCount = 0;
     this.setState('LISTENING');
@@ -120,6 +139,7 @@ export class TOEICStateMachine {
       clearTimeout(this.autoSolveTimer);
     }
     this.autoSolveTimer = setTimeout(() => {
+      this.autoSolveTimer = null;
       if (
         this.context.currentQuestion &&
         (this.context.appState === 'QUESTION_DETECTED' ||
@@ -168,12 +188,7 @@ export class TOEICStateMachine {
     if (this.context.appState === 'IDLE') return;
 
     // Add to buffer
-    this.context.transcriptBuffer += ' ' + finalText;
-
-    // Trim buffer to last ~2500 chars to keep context fresh
-    if (this.context.transcriptBuffer.length > 2500) {
-      this.context.transcriptBuffer = this.context.transcriptBuffer.slice(-2000);
-    }
+    this.context.transcriptBuffer = trimTranscript(this.context.transcriptBuffer + ' ' + finalText);
 
     // Never drop audio that arrives while the preceding question is being
     // solved or displayed. Replay it as soon as the machine resumes listening.
@@ -184,6 +199,7 @@ export class TOEICStateMachine {
       (this.context.appState === 'ERROR' && !!this.context.currentQuestion)
     ) {
       this.deferredTranscriptBuffer += ' ' + finalText;
+      if (this.context.appState === 'ANSWER_READY') this.resumeListening();
       return;
     }
 
@@ -202,7 +218,7 @@ export class TOEICStateMachine {
     const firstMarker = questionMarkers(buffer).find(m => !this.context.processedQuestions.has(m.number));
     if ((!firstMarker || firstMarker.number >= 32) && (this.currentPart === 3 || this.currentPart === 4 ||
         listeningMarkers(buffer).length > 0 ||
-        (detectPassageHeader(buffer)?.start || 0) >= 32)) {
+        (detectPassageHeader(buffer)?.start || Number(buffer.match(GROUP_HEADER)?.[1]) || 0) >= 32)) {
       this.runListeningGroupDetection(buffer);
       return;
     }
@@ -212,17 +228,24 @@ export class TOEICStateMachine {
 
   private runPartTwoDetection(buffer: string) {
     const markers = questionMarkers(buffer);
-    const highWater = Math.max(6, ...this.context.processedQuestions);
-    const firstIndex = markers.findIndex(m => m.number > highWater);
-    if (firstIndex < 0) return;
+    const firstIndex = markers.findIndex(m => !this.context.processedQuestions.has(m.number));
+    if (firstIndex < 0) {
+      // Retain enough text for a number split across chunks, without retaining
+      // minutes of unnumbered noise after the previous Part 2 question.
+      this.questionDetectionBuffer = buffer.slice(-512);
+      return;
+    }
     const first = markers[firstIndex];
     if (first.number > 31) return;
-    const next = markers.slice(firstIndex + 1).find(m => m.number > first.number);
+    const next = markers.slice(firstIndex + 1).find(m => m.number !== first.number);
     const header = buffer.match(GROUP_HEADER);
     const boundary = Math.min(next?.start ?? buffer.length, header?.index ?? buffer.length);
     const segment = buffer.slice(first.start, boundary);
     const text = detectQuestionText(segment, first.number) || '';
     const choices = extractChoices(segment, first.number);
+    const previous = this.context.currentQuestion;
+    const questionChanged = previous?.questionNumber !== first.number || previous.questionText !== text ||
+      getRequiredChoiceLetters(2).some(letter => previous.choices[letter] !== choices[letter]);
     this.currentPart = 2;
     this.context.currentQuestion = {
       questionNumber: first.number, questionText: text, choices, passage: '', part: 2,
@@ -244,6 +267,7 @@ export class TOEICStateMachine {
         this.context.processedQuestions.add(first.number);
         this.clearAutoSolve();
         this.questionDetectionBuffer = '';
+        this.compactCompletedTranscript();
         this.resumeListening();
       }
       return;
@@ -251,7 +275,9 @@ export class TOEICStateMachine {
     if (!text) return;
     if (hasRequiredChoices(choices, 2) && /[.!?]["'’”]?$/.test(choices.C!.trim())) {
       void this.handleQuestionComplete();
-    } else {
+    } else if (questionChanged || !this.autoSolveTimer) {
+      // Repeated labels/noise are not progress. Do not let them continually
+      // restart the deadline while waiting for a response the mic missed.
       this.scheduleAutoSolve(hasRequiredChoices(choices, 2) ? 1200 : 6000);
     }
   }
@@ -294,7 +320,7 @@ export class TOEICStateMachine {
         questionRange: { start, end: start + 2 },
         part: inferTOEICPart(marker.number), timestamp: Date.now(),
       };
-    } else if (prefix) {
+    } else if (prefix && ![start, start + 1, start + 2].some(n => this.context.processedQuestions.has(n))) {
       this.context.currentPassage.text = [this.context.currentPassage.text, prefix].filter(Boolean).join(' ');
     }
     this.currentPart = inferTOEICPart(marker.number);
@@ -304,8 +330,14 @@ export class TOEICStateMachine {
     markers = listeningMarkers(buffer);
     const first = markers[0];
     const nextHeader = buffer.match(GROUP_HEADER);
-    const boundary = Math.min(markers[1]?.start ?? buffer.length, nextHeader?.index ?? buffer.length);
-    const text = buffer.slice(first.end, boundary).trim();
+    const next = markers.find(m => m.number !== first.number);
+    const boundary = Math.min(next?.start ?? buffer.length, nextHeader?.index ?? buffer.length);
+    const repeated = markers.filter(m => m.number === first.number && m.start < boundary);
+    const last = repeated.at(-1)!;
+    // A repeated number from the overlap is not a new question. Prefer the
+    // latest nonempty rendering, retaining the first if the repeat is bare.
+    const latest = buffer.slice(last.end, boundary).trim();
+    const text = latest || buffer.slice(first.end, last.start).trim();
     // A quoted utterance may itself end in '?'; wait for closing quotation and
     // the outer question. Otherwise a numbered boundary or a pause completes it.
     const punctuationEnd = text.endsWith('?');
@@ -341,9 +373,22 @@ export class TOEICStateMachine {
       return;
     }
 
-    // Ensure question has passage context
-    if (question.part !== 3 && question.part !== 4 && !question.passage && this.context.transcriptBuffer) {
-      question.passage = this.context.transcriptBuffer.trim();
+    if (question.part === 2 && !hasRequiredChoices(question.choices, 2)) {
+      if (this.deferredTranscriptBuffer.trim()) {
+        // The next question has started: record this one as unheard instead of
+        // spending an AI request to guess from an incomplete set of responses.
+        this.context.processedQuestions.add(question.questionNumber);
+        this.context.history.push({ questionNumber: question.questionNumber, timestamp: Date.now() });
+        this.questionDetectionBuffer = '';
+        this.compactCompletedTranscript();
+        this.resumeListening();
+      } else {
+        // Keep listening: C may arrive in the next transcription window.
+        this.context.lastError = 'Chưa nghe đủ A/B/C. Đang chờ phần còn lại của câu.';
+        this.setState('WAITING_FOR_CHOICES');
+        this.emit();
+      }
+      return;
     }
 
     // Mark as processed to prevent re-solving
@@ -353,10 +398,6 @@ export class TOEICStateMachine {
 
     // Clear detection buffer for next question
     this.questionDetectionBuffer = '';
-
-    // Small delay before solving to ensure stability
-    await new Promise((r) => setTimeout(r, 200));
-    if (sessionVersion !== this.sessionVersion) return;
 
     this.setState('SOLVING');
     
@@ -380,10 +421,17 @@ export class TOEICStateMachine {
           answer: answer.answer,
           answerText: answer.answerText || (answer.answer ? question.choices[answer.answer] : undefined),
           timestamp: Date.now(),
-          confidence: answer.confidence,
         });
+        this.compactCompletedTranscript();
         
         this.setState('ANSWER_READY');
+
+        // Start the next queued question immediately. Answer display must not
+        // add 2.5 seconds to every question while incoming audio backs up.
+        if (this.deferredTranscriptBuffer.trim()) {
+          this.resumeListening();
+          return;
+        }
         
         // Briefly show the answer, then replay everything heard while solving.
         setTimeout(() => {
@@ -403,6 +451,7 @@ export class TOEICStateMachine {
           questionNumber: question.questionNumber,
           timestamp: Date.now(),
         });
+        this.compactCompletedTranscript();
         
         this.setState('ERROR');
         
@@ -421,10 +470,6 @@ export class TOEICStateMachine {
    */
   forceSolve() {
     if (this.context.currentQuestion) {
-      const q = this.context.currentQuestion;
-      for (const letter of q.part === 3 || q.part === 4 ? [] : getRequiredChoiceLetters(q.part)) {
-        if (!q.choices[letter]) q.choices[letter] = '(not detected)';
-      }
       this.handleQuestionComplete();
     }
   }
@@ -449,6 +494,7 @@ export class TOEICStateMachine {
    */
   reset() {
     this.sessionVersion++;
+    this.completedSinceCleanup = 0;
     this.context = {
       appState: 'IDLE',
       currentQuestion: null,

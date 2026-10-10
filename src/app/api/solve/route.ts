@@ -3,42 +3,23 @@ import OpenAI from 'openai';
 import { inferTOEICPart } from '@/lib/toeic-detector';
 import {
   getGroqApiKeys,
+  getErrorStatus,
   isGroqKeyUnavailableError,
   withGroqKeyFailover,
 } from '@/lib/server/groq-key-pool';
 
-const SYSTEM_PROMPT = `You are an expert TOEIC teacher and test solver. You will analyze TOEIC listening questions and select the best answer.
-
-Rules:
-- For Part 2, choose exactly ONE response from A, B, or C
-- For Parts 3 and 4, the audio contains a passage and three spoken questions, WITHOUT answer choices. Return answer: null and answer_text: a concise suggested answer in English based on the passage. NEVER invent a letter or missing choices.
-- Part 2 is question-response; Part 3 is conversation; Part 4 is a short talk
-- Use the passage/transcript as primary evidence
-- If evidence is missing, or the question requires an unseen graphic, say that the information is insufficient in answer_text and the explanation, with low confidence. Do not invent facts.
-- Identify common TOEIC traps (e.g., distractors that repeat words but change meaning)
-- Keep explanations SHORT and clear (2-3 sentences max)
-- Use simple English (approximately IELTS 5.0 vocabulary)
-- Provide Vietnamese translation of the explanation
-- Provide 2-5 useful vocabulary items with Vietnamese meaning
-- Respond ONLY in the exact JSON format specified
-
-Respond in this exact JSON format:
-{
-  "question_number": <number>,
-  "answer": "<A|B|C for Part 2; null for Part 3/4>",
-  "answer_text": "<suggested answer for Part 3/4; selected response for Part 2>",
-  "confidence": <0.0-1.0>,
-  "question_type": "<purpose|detail|inference|suggestion|action|location|time|person>",
-  "reason": "<short English explanation>",
-  "translation": "<Vietnamese translation of the explanation>",
-  "vocabulary": [
-    {"word": "<English word>", "meaning": "<Vietnamese meaning>"}
-  ]
-}`;
+const CHOICE_PROMPT = 'Solve the TOEIC question-response task. Choose the best provided response by meaning, avoiding repeated-word traps. Return only JSON: {"answer":"A"} (A, B, C, or D when provided). No explanation or additional fields.';
+const PASSAGE_PROMPT = 'Answer the TOEIC question using only its passage. Return only JSON: {"answer_text":"short answer"}. If evidence is missing, answer_text must be "Insufficient information". No explanation or additional fields.';
+const GROQ_MODELS = ['qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'];
+// Scope unavailable models to the credential that actually received the error.
+const unavailableModels = new Map<string, Map<string, { until: number; status: number }>>();
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
+    // Bound provider failover to the client's request budget. A stalled model
+    // must not leave SDK retries running after the listening queue moves on.
+    const solveSignal = AbortSignal.any([request.signal, AbortSignal.timeout(22000)]);
 
     const { part, passage, question_number, question, choices } = body;
     const normalizedPassage = typeof passage === 'string' ? passage.trim() : '';
@@ -54,6 +35,13 @@ export async function POST(request: NextRequest) {
     }
 
     const safeChoices = choices || {};
+    const validAnswers = detectedPart === 2 ? ['A', 'B', 'C'] : ['A', 'B', 'C', 'D'];
+    if (!isSuggestion && (!normalizedQuestion || validAnswers.some(letter =>
+      typeof safeChoices[letter] !== 'string' || !safeChoices[letter].trim() ||
+      /^\(not (?:provided|detected)\)$/i.test(safeChoices[letter].trim())
+    ))) {
+      return NextResponse.json({ error: 'Chưa nghe đủ câu hỏi và các đáp án.' }, { status: 422 });
+    }
 
     // Provider priority: Groq key pool > Gemini > OpenAI.
     const hasGroqKeys = getGroqApiKeys().length > 0;
@@ -75,7 +63,7 @@ export async function POST(request: NextRequest) {
     // Build the user prompt
     let userPrompt = '';
 
-    if (normalizedPassage) {
+    if (isSuggestion && normalizedPassage) {
       userPrompt += `PASSAGE/TRANSCRIPT:\n${normalizedPassage}\n\n`;
     }
 
@@ -92,34 +80,61 @@ export async function POST(request: NextRequest) {
       userPrompt += `D. ${safeChoices.D || '(not provided)'}\n`;
     }
     } else {
-      userPrompt += '\nNo answer choices are available. Suggest the answer CONTENT to this question using only the passage. Set answer to null. If the passage is missing or insufficient, explicitly say so.\n';
+      userPrompt += '\nNo answer choices are available. Return answer_text with the short answer content supported by the passage. If evidence is missing, return "Insufficient information".\n';
     }
-    userPrompt += `\nAnalyze the question against the passage and select the best answer. Respond in JSON only.`;
 
     const generateWithModels = async (
       client: OpenAI,
       models: string[],
       provider: string,
-      stopWhenKeyUnavailable = false
+      apiKey?: string
     ): Promise<string> => {
       let providerError: unknown;
+      const unavailable = apiKey ? unavailableModels.get(apiKey) || new Map<string, { until: number; status: number }>() : null;
+      if (apiKey && unavailable) unavailableModels.set(apiKey, unavailable);
       for (const model of models) {
+        solveSignal.throwIfAborted();
+        const blocked = unavailable?.get(model);
+        if (blocked && blocked.until > Date.now()) {
+          providerError = Object.assign(new Error(`${provider} model temporarily unavailable`), { status: blocked.status });
+          continue;
+        }
         try {
+          const isGroqReasoning = provider === 'Groq' && model.startsWith('openai/gpt-oss-');
           const completion = await client.chat.completions.create({
             model,
             messages: [
-              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'system', content: isSuggestion ? PASSAGE_PROMPT : CHOICE_PROMPT },
               { role: 'user', content: userPrompt },
             ],
             temperature: 0.1,
-            max_tokens: 500,
+            // GPT-OSS spends some of this budget on reasoning. Capping it at 32
+            // can exhaust the budget before it emits the actual answer JSON.
+            max_tokens: isGroqReasoning ? 1024 : isSuggestion ? 96 : 32,
+            ...(provider === 'Groq' ? {
+              reasoning_effort: isGroqReasoning ? 'low' as const : 'none' as const,
+              include_reasoning: false,
+            } : {}),
             response_format: { type: 'json_object' },
-          });
+          }, { signal: solveSignal });
           const result = completion.choices[0]?.message?.content;
-          if (result) return result;
+          if (!result || completion.choices[0]?.finish_reason === 'length') throw new Error('Incomplete model response');
+          const parsed = JSON.parse(result);
+          if (isSuggestion ? typeof parsed.answer_text !== 'string' || !parsed.answer_text.trim() || /^(null|undefined|none|n\/a)$/i.test(parsed.answer_text.trim())
+            : typeof parsed.answer !== 'string' || !validAnswers.includes(parsed.answer.trim().toUpperCase())) {
+            throw new Error('Invalid model answer');
+          }
+          return result;
         } catch (error) {
-          if (stopWhenKeyUnavailable && isGroqKeyUnavailableError(error)) throw error;
-          console.warn(`${provider} model ${model} failed, trying the next model.`, error);
+          solveSignal.throwIfAborted();
+          const status = getErrorStatus(error);
+          // Model limits can differ on the same key. Try another model before
+          // cooling down this key; transcription has its own independent scope.
+          if (apiKey && status !== 429 && status !== 403 && isGroqKeyUnavailableError(error)) throw error;
+          if (status === 403 || status === 404 || status === 429) {
+            unavailable?.set(model, { until: Date.now() + (status === 429 ? 60000 : 600000), status });
+          }
+          console.warn(`${provider} model ${model} failed (HTTP ${status || 'unknown'}); trying the next candidate.`);
           providerError = error;
         }
       }
@@ -135,11 +150,12 @@ export async function POST(request: NextRequest) {
       try {
         content = await withGroqKeyFailover((apiKey) =>
           generateWithModels(
-            new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1' }),
-            ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'],
+            new OpenAI({ apiKey, baseURL: 'https://api.groq.com/openai/v1', timeout: 8000, maxRetries: 0 }),
+            GROQ_MODELS,
             'Groq',
-            true
-          )
+            apiKey
+          ),
+          'solve'
         );
       } catch (error) {
         lastError = error;
@@ -153,6 +169,8 @@ export async function POST(request: NextRequest) {
           new OpenAI({
             apiKey: geminiKey,
             baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+            timeout: 8000,
+            maxRetries: 0,
           }),
           ['gemini-2.0-flash', 'gemini-1.5-flash'],
           'Gemini'
@@ -165,7 +183,7 @@ export async function POST(request: NextRequest) {
     if (!content && hasOpenAIKey) {
       try {
         content = await generateWithModels(
-          new OpenAI({ apiKey: openaiKey }),
+          new OpenAI({ apiKey: openaiKey, timeout: 8000, maxRetries: 0 }),
           ['gpt-4o-mini', 'gpt-4o'],
           'OpenAI'
         );
@@ -175,10 +193,10 @@ export async function POST(request: NextRequest) {
     }
 
     if (!content) {
-      console.error('All candidate models failed. Last error:', lastError);
+      console.error(`All solver candidates failed (HTTP ${getErrorStatus(lastError) || 'unknown'}).`);
       return NextResponse.json(
-        { error: 'No response from AI model' },
-        { status: 500 }
+        { error: 'Không gọi được model giải đáp án. Kiểm tra hạn mức Groq hoặc thử lại.' },
+        { status: 502 }
       );
     }
 
@@ -187,24 +205,20 @@ export async function POST(request: NextRequest) {
 
       // Validate required fields
       const response = {
-        question_number: parsed.question_number || question_number || 0,
-        answer: isSuggestion ? null : parsed.answer || 'A',
-        answer_text: typeof parsed.answer_text === 'string' ? parsed.answer_text.trim() : '',
-        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
-        question_type: parsed.question_type || 'unknown',
-        reason: parsed.reason || 'No explanation available.',
-        translation: parsed.translation || 'Không có giải thích.',
-        vocabulary: Array.isArray(parsed.vocabulary) ? parsed.vocabulary : [],
+        question_number: question_number || 0,
+        answer: isSuggestion ? null : typeof parsed.answer === 'string' ? parsed.answer.trim().toUpperCase() : null,
+        answer_text: isSuggestion && typeof parsed.answer_text === 'string' ? parsed.answer_text.trim() : '',
       };
 
       // Ensure answer is valid
-      const validAnswers = detectedPart === 2 ? ['A', 'B', 'C'] : ['A', 'B', 'C', 'D'];
       if (isSuggestion && !response.answer_text) {
         return NextResponse.json({ error: 'AI did not provide a suggested answer' }, { status: 502 });
       }
-      if (!isSuggestion && !validAnswers.includes(response.answer)) {
-        response.answer = 'A';
-        response.confidence = 0.1;
+      if (!isSuggestion) {
+        if (!response.answer || !validAnswers.includes(response.answer)) {
+          return NextResponse.json({ error: 'AI returned an invalid answer' }, { status: 502 });
+        }
+        response.answer_text = safeChoices[response.answer].trim();
       }
 
       return NextResponse.json(response);

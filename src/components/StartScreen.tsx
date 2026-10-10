@@ -3,7 +3,6 @@
 interface StartScreenProps {
   onStart: () => void;
   onStartTabAudio?: () => void;
-  isSpeechAvailable: boolean;
   lastError: string | null;
 }
 

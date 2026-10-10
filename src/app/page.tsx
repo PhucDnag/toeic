@@ -5,7 +5,6 @@ import Header from '@/components/Header';
 import AudioWaveform from '@/components/AudioWaveform';
 import LiveTranscript from '@/components/LiveTranscript';
 import QuestionCard from '@/components/QuestionCard';
-import AIExplanation from '@/components/AIExplanation';
 import SessionHistory from '@/components/SessionHistory';
 import StartScreen from '@/components/StartScreen';
 
@@ -27,14 +26,11 @@ export default function Home() {
     clearError,
     forceSolve,
     feedTranscript,
-    isSpeechAvailable,
   } = useTOEIC();
 
   const isActive = appState !== 'IDLE';
-  const isListening =
-    appState === 'LISTENING' ||
-    appState === 'QUESTION_DETECTED' ||
-    appState === 'WAITING_FOR_CHOICES';
+  // Capture continues while the solver works and while an answer is displayed.
+  const isListening = microphoneState === 'CONNECTED' && isActive;
 
   return (
     <div className="flex min-h-dvh flex-col overflow-x-hidden bg-zinc-950 text-white xl:h-dvh xl:overflow-hidden">
@@ -70,7 +66,6 @@ export default function Home() {
           <StartScreen
             onStart={startListening}
             onStartTabAudio={startTabAudioListening}
-            isSpeechAvailable={isSpeechAvailable}
             lastError={lastError}
           />
         )}
@@ -83,8 +78,8 @@ export default function Home() {
               <AudioWaveform audioLevel={audioLevel} isActive={isListening} />
             </div>
 
-            {/* Three-panel layout */}
-            <div className="grid flex-1 grid-cols-1 md:grid-cols-2 xl:min-h-0 xl:grid-cols-[minmax(260px,320px)_minmax(420px,1fr)_minmax(280px,340px)] xl:overflow-hidden">
+            {/* Transcript/history and answers */}
+            <div className="grid flex-1 grid-cols-1 md:grid-cols-[minmax(260px,320px)_minmax(0,1fr)] xl:min-h-0 xl:overflow-hidden">
               {/* Left — Transcript + History */}
               <section className="flex min-h-[34rem] min-w-0 flex-col border-b border-white/[0.04] md:min-h-[38rem] md:border-r xl:min-h-0 xl:border-b-0">
                 {/* Transcript */}
@@ -112,20 +107,13 @@ export default function Home() {
                 />
               </section>
 
-              {/* Right — Explanation */}
-              <section className="min-h-96 min-w-0 overflow-hidden border-b border-white/[0.04] md:col-span-2 xl:col-span-1 xl:min-h-0 xl:border-b-0">
-                <AIExplanation
-                  answer={currentAnswer}
-                  isReady={appState === 'ANSWER_READY'}
-                />
-              </section>
             </div>
 
             {/* Bottom Controls */}
             <div className="sticky bottom-0 z-20 flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.04] bg-zinc-950/90 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-xl sm:px-6 xl:relative xl:shrink-0">
               <div className="flex w-full items-center gap-2 sm:w-auto">
                 <span className="text-xs text-zinc-500">
-                  {history.length} question{history.length !== 1 ? 's' : ''} answered
+                  {history.filter(item => item.answer || item.answerText).length} câu đã có đáp án · Tự dọn chữ sau mỗi 3 câu
                 </span>
               </div>
               <div className="flex items-center gap-2">

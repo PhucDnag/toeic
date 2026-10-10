@@ -39,16 +39,6 @@ export interface AIAnswer {
   questionNumber: number;
   answer: 'A' | 'B' | 'C' | 'D' | null;
   answerText?: string;
-  confidence: number;
-  questionType: string;
-  reason: string;
-  translation: string;
-  vocabulary: VocabularyItem[];
-}
-
-export interface VocabularyItem {
-  word: string;
-  meaning: string;
 }
 
 export interface SessionHistoryItem {

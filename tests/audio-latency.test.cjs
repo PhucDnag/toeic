@@ -53,6 +53,46 @@ test('quiet speech is preserved and amplified without clipping; silence and clic
   assert.equal(hasAudibleAudio(click), false);
 });
 
+test('a quiet speaker sentence survives long pauses and reaches transcription volume', () => {
+  const samples = new Float32Array(64000);
+  for (let i = 24000; i < 32000; i++) samples[i] = Math.sin(i / 10) * 0.0003;
+  assert.equal(hasAudibleAudio(samples), true, 'silence must not dilute the quiet sentence');
+  const normalized = normalizeAudio(samples);
+  const rms = Math.sqrt(normalized.reduce((sum, sample) => sum + sample * sample, 0) / normalized.length);
+  assert.ok(rms >= 0.019, 'quiet speaker audio must be amplified beyond the old 16x limit');
+  const loud = Float32Array.from({ length: 16000 }, (_, i) => Math.sin(i / 10) * 0.9);
+  assert.ok(normalizeAudio(loud).every(sample => Math.abs(sample) <= 0.95));
+});
+
+test('repeated sentences after a silent overlap are retained, real overlapping words are removed', async t => {
+  const service = new AudioCaptureService();
+  const transcripts = [];
+  service.setCallbacks(text => transcripts.push(text), () => {}, error => assert.fail(error));
+  const results = ['Thank you.', 'Thank you.', 'Thank you. The meeting starts now.'];
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ text: results.shift() }));
+  service.pendingChunks = [false, false, true].map(overlapsPrevious => ({
+    samples: new Float32Array(16000).fill(0.01), sessionId: 0, overlapsPrevious,
+  }));
+  await service.processQueue();
+  assert.deepEqual(transcripts, ['Thank you.', 'Thank you.', 'The meeting starts now.']);
+});
+
+test('chunks remember whether the retained audio contains speech or only a pause', () => {
+  const service = fixture();
+  service.sampleBuffer = [...new Array(16000).fill(0.1), ...new Array(12800).fill(0)];
+  service.freshSpeech = true;
+  service.trailingSilenceSamples = 12800;
+  service.queueReadyChunks();
+  service.sampleBuffer.push(...new Array(16000).fill(0.1), ...new Array(12800).fill(0));
+  service.freshSpeech = true;
+  service.queueReadyChunks();
+  assert.deepEqual(service.pendingChunks.map(chunk => chunk.overlapsPrevious), [false, false]);
+  const continuous = fixture();
+  continuous.sampleBuffer = new Array(120000).fill(0.1);
+  continuous.queueReadyChunks();
+  assert.deepEqual(continuous.pendingChunks.map(chunk => chunk.overlapsPrevious), [false, true]);
+});
+
 test('failed chunk is retried before the following chunk and genuine Thank you is retained', async t => {
   const service = new AudioCaptureService();
   const transcripts = [];
@@ -69,7 +109,7 @@ test('failed chunk is retried before the following chunk and genuine Thank you i
   await service.processQueue();
   assert.equal(requests, 3);
   assert.deepEqual(transcripts, ['Thank you.', 'Number 32. Where are the speakers?']);
-  assert.equal(contexts[2], 'Thank you.');
+  assert.deepEqual(contexts, [null, null, null], 'predicted text must never feed the next recognition request');
 });
 
 test('a permanent API failure is visible instead of silently losing audio', async t => {

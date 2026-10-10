@@ -3,8 +3,9 @@ import 'server-only';
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 const INVALID_KEY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-let activeKeyIndex = 0;
-const cooldownUntilByKey = new Map<string, number>();
+const activeKeyIndexByScope = new Map<string, number>();
+const cooldownsByScope = new Map<string, Map<string, number>>();
+const invalidKeyUntil = new Map<string, number>();
 
 export class GroqKeyPoolExhaustedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -88,7 +89,8 @@ function retryDelayMs(error: unknown): number {
 }
 
 export async function withGroqKeyFailover<T>(
-  operation: (apiKey: string, keyNumber: number) => Promise<T>
+  operation: (apiKey: string, keyNumber: number) => Promise<T>,
+  scope = 'default'
 ): Promise<T> {
   const keys = getGroqApiKeys();
   if (keys.length === 0) {
@@ -96,9 +98,12 @@ export async function withGroqKeyFailover<T>(
   }
 
   const now = Date.now();
+  const activeKeyIndex = activeKeyIndexByScope.get(scope) || 0;
+  const cooldownUntilByKey = cooldownsByScope.get(scope) || new Map<string, number>();
+  cooldownsByScope.set(scope, cooldownUntilByKey);
   const orderedIndexes = keys.map((_, offset) => (activeKeyIndex + offset) % keys.length);
   const availableIndexes = orderedIndexes.filter(
-    (index) => (cooldownUntilByKey.get(keys[index]) || 0) <= now
+    (index) => (cooldownUntilByKey.get(keys[index]) || 0) <= now && (invalidKeyUntil.get(keys[index]) || 0) <= now
   );
 
   if (availableIndexes.length === 0) {
@@ -110,7 +115,7 @@ export async function withGroqKeyFailover<T>(
     const apiKey = keys[index];
     try {
       const result = await operation(apiKey, index + 1);
-      activeKeyIndex = index;
+      activeKeyIndexByScope.set(scope, index);
       cooldownUntilByKey.delete(apiKey);
       return result;
     } catch (error) {
@@ -118,9 +123,14 @@ export async function withGroqKeyFailover<T>(
 
       lastError = error;
       cooldownUntilByKey.set(apiKey, Date.now() + retryDelayMs(error));
-      activeKeyIndex = (index + 1) % keys.length;
+      // A 403 can be permission for one endpoint only. Only an invalid
+      // credential (401) should disable both chat and transcription.
+      if (getErrorStatus(error) === 401) {
+        invalidKeyUntil.set(apiKey, Date.now() + INVALID_KEY_COOLDOWN_MS);
+      }
+      activeKeyIndexByScope.set(scope, (index + 1) % keys.length);
       console.warn(
-        `Groq API key #${index + 1} is unavailable (HTTP ${getErrorStatus(error) || 'unknown'}); trying the next key.`
+        `Groq ${scope} key #${index + 1} is unavailable (HTTP ${getErrorStatus(error) || 'unknown'}); trying the next key.`
       );
     }
   }

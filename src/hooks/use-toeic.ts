@@ -3,9 +3,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AppState, MicrophoneState, TOEICQuestion, AIAnswer, SessionHistoryItem } from '@/lib/types';
 import { TOEICStateMachine } from '@/lib/state-machine';
-import { SpeechService } from '@/lib/speech';
 import { AudioCaptureService } from '@/lib/audio-capture';
 import { solveQuestion } from '@/lib/ai-client';
+import { trimTranscript } from '@/lib/transcript-window';
 
 export interface UseTOEICReturn {
   // State
@@ -35,9 +35,6 @@ export interface UseTOEICReturn {
   clearError: () => void;
   forceSolve: () => void;
   feedTranscript: (text: string) => void;
-  
-  // Speech available
-  isSpeechAvailable: boolean;
 }
 
 export function useTOEIC(): UseTOEICReturn {
@@ -51,29 +48,36 @@ export function useTOEIC(): UseTOEICReturn {
   const [currentAnswer, setCurrentAnswer] = useState<AIAnswer | null>(null);
   const [history, setHistory] = useState<SessionHistoryItem[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
-  const isSpeechAvailable = true;
   
   // Services
   const stateMachineRef = useRef<TOEICStateMachine | null>(null);
-  const speechServiceRef = useRef<SpeechService | null>(null);
   const audioCaptureRef = useRef<AudioCaptureService | null>(null);
   const actionVersionRef = useRef(0);
   
   // Initialize services
   useEffect(() => {
     const sm = new TOEICStateMachine();
-    const speech = new SpeechService();
     const capture = new AudioCaptureService();
 
     stateMachineRef.current = sm;
-    speechServiceRef.current = speech;
     audioCaptureRef.current = capture;
+
+    let lastResult: { question: TOEICQuestion; answer: AIAnswer } | null = null;
+    sm.setTranscriptCleanupCallback(remainingText => {
+      setTranscript(remainingText);
+      setInterimTranscript('');
+    });
 
     // Set up state machine callbacks
     sm.onStateChange((newState, context) => {
+      if (newState === 'IDLE') lastResult = null;
+      if (newState === 'ANSWER_READY' && context.currentQuestion && context.currentAnswer) {
+        lastResult = { question: context.currentQuestion, answer: context.currentAnswer };
+      }
+      const displayedResult = newState === 'LISTENING' && !context.currentQuestion ? lastResult : null;
       setAppState(newState);
-      setCurrentQuestion(context.currentQuestion);
-      setCurrentAnswer(context.currentAnswer);
+      setCurrentQuestion(displayedResult?.question ?? context.currentQuestion);
+      setCurrentAnswer(displayedResult?.answer ?? context.currentAnswer);
       setHistory([...context.history]);
       setLastError(context.lastError);
     });
@@ -84,10 +88,7 @@ export function useTOEIC(): UseTOEICReturn {
     // Set up Universal Audio Capture (Groq Whisper AI + Waveform Level)
     capture.setCallbacks(
       (text) => {
-        setTranscript((prev) => {
-          const updated = prev ? prev + ' ' + text : text;
-          return updated.length > 3000 ? updated.slice(-2500) : updated;
-        });
+        setTranscript(prev => trimTranscript(prev + ' ' + text));
         setInterimTranscript('');
         sm.processTranscript(text);
       },
@@ -96,23 +97,6 @@ export function useTOEIC(): UseTOEICReturn {
       },
       (error) => {
         setLastError(error);
-      }
-    );
-
-    // Web Speech API for fast live interim display
-    speech.setCallbacks(
-      (text, isFinal) => {
-        if (isFinal) {
-          // Whisper is the single source of finalized text. Committing the Web
-          // Speech result too would duplicate each microphone sentence and make
-          // the state machine process the same question twice.
-          setInterimTranscript(text);
-        } else {
-          setInterimTranscript(text);
-        }
-      },
-      (error) => {
-        console.warn('WebSpeech note:', error);
       }
     );
 
@@ -129,7 +113,6 @@ export function useTOEIC(): UseTOEICReturn {
 
     return () => {
       void capture.stop(false);
-      speech.stop();
       sm.stop();
     };
   }, []);
@@ -145,7 +128,6 @@ export function useTOEIC(): UseTOEICReturn {
   const startListening = useCallback(async () => {
     actionVersionRef.current++;
     const capture = audioCaptureRef.current;
-    const speech = speechServiceRef.current;
     const sm = stateMachineRef.current;
 
     if (!sm || !capture) return;
@@ -159,10 +141,9 @@ export function useTOEIC(): UseTOEICReturn {
       return;
     }
 
-    // Also start Web Speech API for live interim display if available
-    if (speech && speech.isAvailable()) {
-      speech.start();
-    }
+    // Use a single mic consumer with explicit audio constraints. Web Speech
+    // opens another input with browser-controlled processing, which can suppress
+    // speaker playback on devices that share their microphone processing.
 
     setMicrophoneState('CONNECTED');
     sm.start();
@@ -178,7 +159,6 @@ export function useTOEIC(): UseTOEICReturn {
     setLastError(null);
     const success = await capture.startDisplayMedia();
     if (success) {
-      speechServiceRef.current?.stop();
       setInterimTranscript('');
       setMicrophoneState('CONNECTED');
       sm.start();
@@ -189,7 +169,6 @@ export function useTOEIC(): UseTOEICReturn {
     const actionVersion = ++actionVersionRef.current;
     const capture = audioCaptureRef.current;
 
-    speechServiceRef.current?.stop();
     setInterimTranscript('');
     setAudioLevel(0);
     setMicrophoneState('NOT_CONNECTED');
@@ -203,13 +182,13 @@ export function useTOEIC(): UseTOEICReturn {
   const reset = useCallback(() => {
     actionVersionRef.current++;
     void audioCaptureRef.current?.stop(false);
-    speechServiceRef.current?.stop();
     stateMachineRef.current?.reset();
     setTranscript('');
     setInterimTranscript('');
     setAudioLevel(0);
     setHistory([]);
     setLastError(null);
+    setMicrophoneState('NOT_CONNECTED');
     try {
       localStorage.removeItem('toeic_session');
     } catch { /* ignore */ }
@@ -227,7 +206,7 @@ export function useTOEIC(): UseTOEICReturn {
   const feedTranscript = useCallback((text: string) => {
     const sm = stateMachineRef.current;
     if (!sm) return;
-    setTranscript((prev) => (prev ? prev + ' ' + text : text));
+    setTranscript(prev => trimTranscript(prev + ' ' + text));
     sm.processTranscript(text);
   }, []);
 
@@ -248,6 +227,5 @@ export function useTOEIC(): UseTOEICReturn {
     clearError,
     forceSolve,
     feedTranscript,
-    isSpeechAvailable,
   };
 }
